@@ -150,29 +150,73 @@ class PersonnelStore:
             )
         return sorted(result, key=lambda x: x["dahili_ad"])
 
+    @staticmethod
+    def _cell_str(row: tuple | list, index: int) -> str:
+        if index >= len(row) or row[index] is None:
+            return ""
+        return str(row[index]).strip()
+
+    @staticmethod
+    def _is_header_row(ad: str, dahili: str, username: str) -> bool:
+        """Başlık satırını atla (Türkçe / İngilizce)."""
+        markers = {
+            ad.casefold(),
+            dahili.casefold(),
+            username.casefold().lstrip("@"),
+        }
+        header_tokens = {
+            "personel",
+            "personel adı",
+            "personel adi",
+            "personel ismi",
+            "ad",
+            "adı",
+            "adi",
+            "isim",
+            "name",
+            "dahili",
+            "dahili adı",
+            "dahili adi",
+            "dahili_ad",
+            "extension",
+            "extensionname",
+            "telegram",
+            "telegram kullanıcı adı",
+            "telegram kullanici adi",
+            "username",
+            "kullanıcı adı",
+            "kullanici adi",
+            "@username",
+        }
+        return bool(markers & header_tokens)
+
     def load_from_excel(self, excel_path: Path) -> int:
+        """Excel'den toplu personel ekle/güncelle.
+
+        Sütun sırası (zorunlu):
+          A: Personel ismi
+          B: Dahili adı
+          C: Telegram kullanıcı adı (@opsizonal)
+        """
         if not excel_path.exists():
             return 0
 
         count = 0
-        wb = load_workbook(excel_path, read_only=True)
+        wb = load_workbook(excel_path, read_only=True, data_only=True)
         try:
             ws = wb.active
             for row in ws.iter_rows(values_only=True):
                 if not row:
                     continue
-                dahili = str(row[0]).strip() if row[0] else ""
-                ad = str(row[1]).strip() if row[1] else ""
-                username = str(row[2]).strip() if len(row) > 2 and row[2] else ""
 
-                if not dahili or dahili.lower() in {
-                    "dahili",
-                    "dahili_ad",
-                    "extension",
-                    "extensionname",
-                }:
+                # A=isim, B=dahili, C=telegram username
+                ad = self._cell_str(row, 0)
+                dahili = self._cell_str(row, 1)
+                username = self._cell_str(row, 2)
+
+                if self._is_header_row(ad, dahili, username):
                     continue
-                if not ad:
+                if not dahili or not ad:
                     continue
 
                 if self.add_or_update(dahili, ad, username, save=False):

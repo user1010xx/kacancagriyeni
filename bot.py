@@ -130,7 +130,8 @@ HELP_TEXT = (
     "/personelekle <dahili> <ad> <@kullanici> - Personel ekle/güncelle\n"
     "/personelsil <dahili> - Personeli sil\n"
     "/personeller - Kayıtlı personelleri listele\n"
-    "Excel ile personel yüklemek için .xlsx dosyası gönderin (3 sütun: dahili, ad, @username)\n"
+    "Excel ile toplu personel: .xlsx gönderin\n"
+    "  A=Personel ismi | B=Dahili adı | C=Telegram kullanıcı adı\n"
     "Personeller özel mesaj alabilmek için bota DM'den /start yazmalıdır.\n"
     "Örnek: /kacancagri 15.06.2026, 25.06.2026"
 )
@@ -451,20 +452,52 @@ async def personeller_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def personel_excel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     doc = update.message.document
-    if not doc or not doc.file_name.lower().endswith(".xlsx"):
+    if not doc or not doc.file_name:
         return
+
+    name_lower = doc.file_name.lower()
+    if name_lower.endswith((".xls", ".csv")):
+        await update.message.reply_text(
+            "Lütfen .xlsx formatında gönderin (Excel → Farklı Kaydet → .xlsx).\n\n"
+            "Sütun sırası:\n"
+            "• A: Personel ismi\n"
+            "• B: Dahili adı\n"
+            "• C: Telegram kullanıcı adı"
+        )
+        return
+    if not name_lower.endswith((".xlsx", ".xlsm")):
+        # Diğer dosya türlerine karışma
+        return
+
+    await update.message.reply_text("Excel işleniyor, lütfen bekleyin...")
 
     file = await context.bot.get_file(doc.file_id)
     temp_path = DATA_DIR / "temp_personel_upload.xlsx"
     await file.download_to_drive(temp_path)
 
     try:
+        before = personnel_store.count()
         count = personnel_store.load_from_excel(temp_path)
+        after = personnel_store.count()
+        if count == 0:
+            await update.message.reply_text(
+                "⚠️ Excel'den personel okunamadı.\n\n"
+                "Kontrol edin:\n"
+                "• A sütunu: Personel ismi\n"
+                "• B sütunu: Dahili adı\n"
+                "• C sütunu: Telegram kullanıcı adı\n"
+                "• İlk satır başlık olabilir (otomatik atlanır)\n"
+                "• Dosya .xlsx olmalı"
+            )
+            return
+
         await update.message.reply_text(
-            f"✅ Personel Excel işlendi.\n"
-            f"{count} personel güncellendi veya eklendi.\n"
-            f"Toplam personel: {personnel_store.count()}\n"
-            "Personeller bota DM'den /start yazmalıdır."
+            f"✅ Toplu personel Excel işlendi.\n"
+            f"• İşlenen satır: {count}\n"
+            f"• Önceki toplam: {before}\n"
+            f"• Şimdiki toplam: {after}\n\n"
+            "Personeller özel mesaj için bota DM'den /start yazmalıdır.\n"
+            "Liste: /personeller"
         )
     except Exception as e:
         logger.exception("Personel Excel işlenemedi")

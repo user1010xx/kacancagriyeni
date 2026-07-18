@@ -40,14 +40,39 @@ def test_excel_bulk_save_once(tmp_path: Path):
     excel_path = tmp_path / "personel.xlsx"
     wb = Workbook()
     ws = wb.active
-    ws.append(["105", "Ali", "@ali"])
-    ws.append(["106", "Veli", "@veli"])
+    # A=personel ismi, B=dahili, C=telegram username
+    ws.append(["Personel ismi", "Dahili adı", "Telegram kullanıcı adı"])
+    ws.append(["Ali", "105", "@ali"])
+    ws.append(["Veli", "106", "@veli"])
     wb.save(excel_path)
 
     store = PersonnelStore(tmp_path / "personnels.json")
     count = store.load_from_excel(excel_path)
     assert count == 2
     assert store.count() == 2
+    assert store.get("105")["personel_adi"] == "Ali"
+    assert store.get("105")["telegram_username"] == "ali"
+    assert store.get("106")["personel_adi"] == "Veli"
 
     raw = json.loads((tmp_path / "personnels.json").read_text(encoding="utf-8"))
     assert "105" in raw and "106" in raw
+
+
+def test_excel_bulk_preserves_chat_id_on_update(tmp_path: Path):
+    from openpyxl import Workbook
+
+    store = PersonnelStore(tmp_path / "personnels.json")
+    store.add_or_update("105", "Ali", "ali", telegram_chat_id="999")
+
+    excel_path = tmp_path / "personel.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["Ali Yılmaz", "105", "ali_new"])
+    wb.save(excel_path)
+
+    count = store.load_from_excel(excel_path)
+    assert count == 1
+    row = store.get("105")
+    assert row["personel_adi"] == "Ali Yılmaz"
+    assert row["telegram_username"] == "ali_new"
+    assert row["telegram_chat_id"] == "999"

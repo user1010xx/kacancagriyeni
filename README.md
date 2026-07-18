@@ -107,7 +107,7 @@ Bot aynı kaynağı kullanır:
 | `/iletilenkacancagri 28.06.2026` | İletilen çağrı + geri arama raporu |
 | `/personelekle` `/personelsil` `/personeller` | Personel yönetimi |
 | `/temizle` | Eski dedup kayıtlarını temizle |
-| Excel (.xlsx) yükle | 3 sütun: dahili, ad, @username |
+| Excel (.xlsx) yükle | Toplu personel: A=isim, B=dahili, C=@username |
 
 **DM için:** Personel bota özel sohbetten `/start` yazmalıdır.
 
