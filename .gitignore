@@ -1,0 +1,57 @@
+# Secrets & local env
+.env
+.env.*
+!.env.example
+
+# Runtime data (personel, dedup, logs)
+data/
+*.log
+bot.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Local / private materials — never commit
+toniva dokument/
+toniva*/
+_toniva_preview/
+invekto api/
+**/INVEKTO*
+**/*API*DOCUMENT*
+**/*documents.docx
+**/apı documents.docx
+samples/
+secrets/
+*.pem
+*.key
+credentials*
+service-account*.json
+
+# Ad-hoc debug / one-off scripts
+debug_*.py
+ocr_debug.py
+check_bot.py
+check_webhook.py
+test_api.py
+test_api2.py
+test_1830_1900.py
+terminals/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+~$*
+.idea/
+.vscode/
+*.swp
