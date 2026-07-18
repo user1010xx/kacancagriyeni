@@ -117,23 +117,31 @@ def _report_today() -> date:
 HELP_TEXT = (
     "Merhaba! Bu bot PBX kaçan (cevapsız) çağrıları Telegram'a iletir.\n"
     "Destek: Toniva (varsayılan) ve Invekto.\n\n"
-    "Komutlar:\n"
+    "── Komutlar ──\n"
     "/ayar - Mevcut ayarları göster\n"
-    "/firmakodu <kod> - Invekto firma kodu (yalnızca Invekto provider)\n"
+    "/firmakodu <kod> - Invekto firma kodu (yalnızca Invekto)\n"
     "/chatid - Bu grubun ID'sini göster\n"
     "/ping - Bot bağlantı testi\n"
-    "/stats - Bot istatistikleri (dedup kaydı, vs.)\n"
+    "/stats - Bot istatistikleri\n"
     "/temizle - Eski dedup kayıtlarını temizle\n"
-    "/kuyruklar - PBX kuyruk/departman adlarını listele\n"
-    "/kacancagri <başlangıç>, <bitiş> - Tarih aralığındaki kaçan çağrıları Excel olarak gönder\n"
-    "/iletilenkacancagri <tarih> - Seçilen gün için iletilen çağrıları Excel gönder\n"
-    "/personelekle <dahili> <ad> <@kullanici> - Personel ekle/güncelle\n"
-    "/personelsil <dahili> - Personeli sil\n"
-    "/personeller - Kayıtlı personelleri listele\n"
-    "Excel ile toplu personel: .xlsx gönderin\n"
-    "  A=Personel ismi | B=Dahili adı | C=Telegram kullanıcı adı\n"
-    "Personeller özel mesaj alabilmek için bota DM'den /start yazmalıdır.\n"
-    "Örnek: /kacancagri 15.06.2026, 25.06.2026"
+    "/kuyruklar - PBX kuyruk/departman listesi\n"
+    "/kacancagri 15.06.2026, 25.06.2026 - Kaçan çağrı Excel raporu\n"
+    "/iletilenkacancagri 28.06.2026 - İletilen çağrı Excel raporu\n"
+    "/personelekle 105 Ahmet @ahmet - Tek personel ekle/güncelle\n"
+    "/personelsil 105 - Personel sil\n"
+    "/personeller - Kayıtlı personelleri listele\n\n"
+    "── Toplu personel ekleme (Excel) ──\n"
+    "Bu gruba bir .xlsx dosyası gönderin.\n"
+    "Sütun sırası (önemli):\n"
+    "  A sütunu → Personel ismi\n"
+    "  B sütunu → Dahili adı\n"
+    "  C sütunu → Telegram kullanıcı adı\n"
+    "Örnek satır: Ahmet Yılmaz | 105 | ahmet_yilmaz\n"
+    "İlk satır başlık olabilir (otomatik atlanır).\n"
+    "Var olan dahili güncellenir; DM bağlantısı korunur.\n\n"
+    "── Özel mesaj (DM) ──\n"
+    "Personel, bota özel sohbetten /start yazmalıdır.\n"
+    "Böylece kaçan çağrı bildirimi kişiye de iletilir.\n"
 )
 
 
@@ -401,8 +409,12 @@ async def temizle_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def personelekle_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(context.args) < 3:
         await update.message.reply_text(
-            "Kullanım: /personelekle 105 \"Ahmet Yılmaz\" @ahmet_yilmaz\n"
-            "veya /personelekle 105 Ahmet @ahmet_yilmaz"
+            "Tek personel:\n"
+            "/personelekle 105 Ahmet @ahmet_yilmaz\n"
+            "veya /personelekle 105 \"Ahmet Yılmaz\" @ahmet_yilmaz\n\n"
+            "Toplu ekleme: gruba .xlsx gönderin\n"
+            "A=Personel ismi | B=Dahili adı | C=Telegram kullanıcı adı\n"
+            "Detay: /help"
         )
         return
 
@@ -438,7 +450,13 @@ async def personelsil_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def personeller_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     items = personnel_store.get_all()
     if not items:
-        await update.message.reply_text("Kayıtlı personel yok. Excel veya /personelekle ile ekleyin.")
+        await update.message.reply_text(
+            "Kayıtlı personel yok.\n\n"
+            "Tek ekle: /personelekle 105 Ahmet @ahmet\n"
+            "Toplu ekle: gruba .xlsx gönder\n"
+            "  A=Personel ismi | B=Dahili adı | C=Telegram kullanıcı adı\n"
+            "Detay: /start veya /help"
+        )
         return
 
     lines = ["📋 Kayıtlı Personeller\n"]
