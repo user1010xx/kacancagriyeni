@@ -170,11 +170,9 @@ def _rows_from_columns_matrix(
 def _extract_rows(body: Any) -> list[dict[str, Any]]:
     """Toniva yanıtından satır listesini çıkarır.
 
-    Desteklenen şekiller:
-    - [ {...}, {...} ]
-    - { rows|data|items|records|result: [ {...} ] }
-    - { columns: [...], rows|data: [ [...], ... ] }  ← tablo/CDR
-    - iç içe payload / result sarmalayıcıları
+    ÖNEMLİ: Birden fazla liste varsa EN UZUN dict-listesini seç.
+    (Özet 30 satır + asıl data 6000 satır senaryosunda küçük listeye
+    takılmamak için — production'da 30 satır / Excel 6800 satır bug'ı.)
     """
     if isinstance(body, list):
         if not body:
@@ -186,6 +184,8 @@ def _extract_rows(body: Any) -> list[dict[str, Any]]:
     if not isinstance(body, dict):
         raise TonivaError("Toniva API beklenmeyen yanıt tipi döndürdü.")
 
+    candidates: list[list[dict[str, Any]]] = []
+
     # Tablo formatı: columns + matrix
     for col_key in ("columns", "Columns", "fields", "Fields", "headers", "Headers"):
         cols = body.get(col_key)
@@ -195,37 +195,8 @@ def _extract_rows(body: Any) -> list[dict[str, Any]]:
             matrix = body.get(row_key)
             table = _rows_from_columns_matrix(cols, matrix)
             if table:
-                logger.info(
-                    "Toniva satırlar tablo formatından okundu (columns=%s, rows=%s)",
-                    len(cols) if isinstance(cols, list) else "?",
-                    len(table),
-                )
-                return table
+                candidates.append(table)
 
-    # Bilinen anahtarlar (dict satırlar)
-    for key in (
-        "rows",
-        "data",
-        "Data",
-        "items",
-        "result",
-        "records",
-        "calls",
-        "list",
-        "payload",
-        "content",
-    ):
-        value = body.get(key)
-        if isinstance(value, list):
-            if value and isinstance(value[0], dict):
-                return [r for r in value if isinstance(r, dict)]
-            # list of lists without columns at this level — skip
-        if isinstance(value, dict):
-            nested = _extract_rows(value)
-            if nested:
-                return nested
-
-    # Son çare: meta dışındaki en büyük dict-listesi (derinlik 3)
     skip_keys = {
         "meta",
         "Meta",
@@ -238,43 +209,68 @@ def _extract_rows(body: Any) -> list[dict[str, Any]]:
         "Status",
         "columns",
         "Columns",
+        "headers",
+        "Headers",
+        "fields",
+        "Fields",
     }
 
-    def _find_dict_lists(obj: Any, depth: int = 0) -> list[list[dict[str, Any]]]:
-        if depth > 3:
-            return []
-        found: list[list[dict[str, Any]]] = []
+    def _find_dict_lists(obj: Any, depth: int = 0) -> None:
+        if depth > 4:
+            return
         if isinstance(obj, list) and obj and isinstance(obj[0], dict):
-            found.append([r for r in obj if isinstance(r, dict)])
-            return found
+            candidates.append([r for r in obj if isinstance(r, dict)])
+            return
         if isinstance(obj, dict):
             for k, v in obj.items():
                 if k in skip_keys:
                     continue
-                found.extend(_find_dict_lists(v, depth + 1))
-        return found
+                _find_dict_lists(v, depth + 1)
 
-    candidates = _find_dict_lists(body)
-    if candidates:
-        best = max(candidates, key=len)
-        logger.debug("Toniva satırlar recursive fallback ile okundu (%s satır).", len(best))
-        return best
+    _find_dict_lists(body)
 
-    # Boş yanıtta anahtarları logla — üretim debug
-    if body:
-        logger.warning(
-            "Toniva yanıtında satır listesi bulunamadı. top_keys=%s",
-            list(body.keys())[:20],
+    if not candidates:
+        if body:
+            logger.warning(
+                "Toniva yanıtında satır listesi bulunamadı. top_keys=%s",
+                list(body.keys())[:20],
+            )
+        return []
+
+    best = max(candidates, key=len)
+    if len(candidates) > 1:
+        sizes = sorted((len(c) for c in candidates), reverse=True)[:5]
+        logger.info(
+            "Toniva birden fazla satır listesi var; en uzunu seçildi size=%s adaylar=%s",
+            len(best),
+            sizes,
         )
-    return []
+    return best
 
 
 def _extract_meta(body: Any) -> dict[str, Any]:
-    if isinstance(body, dict):
-        meta = body.get("meta") or body.get("Meta") or {}
-        if isinstance(meta, dict):
-            return meta
-    return {}
+    if not isinstance(body, dict):
+        return {}
+    meta = body.get("meta") or body.get("Meta") or {}
+    if isinstance(meta, dict) and meta:
+        return meta
+    # Bazı yanıtlarda total üst seviyede
+    out: dict[str, Any] = {}
+    for k in (
+        "total_count",
+        "totalCount",
+        "total",
+        "Total",
+        "truncated",
+        "page",
+        "pageSize",
+        "page_size",
+    ):
+        if k in body:
+            out[k] = body[k]
+    if isinstance(meta, dict):
+        out = {**meta, **out}
+    return out
 
 
 def _request_json(
@@ -742,7 +738,7 @@ def normalize_conversation_row(record: dict[str, Any]) -> dict[str, Any]:
     if not call_time_raw and call_date_raw and ("T" in str(call_date_raw) or " " in str(call_date_raw)):
         call_time_raw = call_date_raw
 
-    # Dahili numarası (622) — UI: DAHİLİ NUMARASI
+    # Dahili numarası (622) — UI/Excel: DAHİLİ NUMARASI / Dahili Numarası
     extension = _field(
         record,
         "Extension",
@@ -753,6 +749,7 @@ def normalize_conversation_row(record: dict[str, Any]) -> dict[str, Any]:
         "DahiliNumarasi",
         "Dahili Numarası",
         "DAHİLİ NUMARASI",
+        "Dahili Numarasi",
         "extensionNumber",
         "ExtensionNumber",
         "agentExtension",
@@ -772,7 +769,7 @@ def normalize_conversation_row(record: dict[str, Any]) -> dict[str, Any]:
         if ext_slug and _looks_like_extension(ext_slug) and not _looks_like_external_phone(ext_slug):
             extension = ext_slug
 
-    # Dahili adı (seda) — UI: DAHİLİ ADI
+    # Dahili adı (seda) — UI/Excel: DAHİLİ ADI / Dahili Adı
     extension_name = _field(
         record,
         "ExtensionName",
@@ -788,6 +785,7 @@ def normalize_conversation_row(record: dict[str, Any]) -> dict[str, Any]:
         "dahili_adi",
         "Dahili Adı",
         "DAHİLİ ADI",
+        "Dahili Adi",
         "User",
         "userName",
         "DisplayName",
@@ -1068,6 +1066,128 @@ def fetch_missed_calls(
     return missed
 
 
+def _conversations_page_size() -> int:
+    try:
+        return max(50, min(int(os.getenv("TONIVA_PAGE_SIZE", "5000")), 5000))
+    except ValueError:
+        return 5000
+
+
+def _fetch_conversations_pages(
+    start_date: date,
+    end_date: date,
+    *,
+    min_call_duration: int | None,
+    min_ring_duration: int | None,
+    timeout: int,
+) -> list[dict[str, Any]]:
+    """Tek tarih aralığı için ZORUNLU sayfalı conversations çekimi.
+
+    Kök bug: pageSize vermeden istek → API bazen varsayılan ~30 satır döner,
+    truncated=false olduğu için eski kod sayfalamayı hiç başlatmıyordu.
+    Excel export günde ~6800 satır; 30 satırla personel eşlemesi imkânsız.
+    """
+    page_size = _conversations_page_size()
+    all_rows: list[dict[str, Any]] = []
+    seen_fingerprints: set[str] = set()
+    max_pages = 200
+    meta_total: int | None = None
+
+    for page in range(1, max_pages + 1):
+        try:
+            rows, meta = fetch_report(
+                "conversations",
+                start_date,
+                end_date,
+                page=page,
+                page_size=page_size,
+                min_call_duration=min_call_duration,
+                min_ring_duration=min_ring_duration,
+                timeout=timeout,
+            )
+        except TonivaError as exc:
+            # page/pageSize desteklenmiyorsa ilk sayfada paramsız dene
+            if page == 1:
+                logger.warning(
+                    "Toniva conversations sayfalı istek başarısız, paramsız denenecek: %s",
+                    exc,
+                )
+                rows, meta = fetch_report(
+                    "conversations",
+                    start_date,
+                    end_date,
+                    min_call_duration=min_call_duration,
+                    min_ring_duration=min_ring_duration,
+                    timeout=timeout,
+                )
+                all_rows.extend(rows)
+                break
+            raise
+
+        if meta_total is None:
+            raw_total = meta.get("total_count") or meta.get("totalCount") or meta.get("total")
+            try:
+                meta_total = int(raw_total) if raw_total is not None else None
+            except (TypeError, ValueError):
+                meta_total = None
+
+        if not rows:
+            break
+
+        new_count = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            # Basit dedup (aynı sayfa tekrarı)
+            fp = str(
+                row.get("callId")
+                or row.get("CallID")
+                or row.get("id")
+                or row.get("ID")
+                or (
+                    f"{row.get('Phone') or row.get('phone') or row.get('Telefon')}"
+                    f"|{row.get('Date') or row.get('Tarih') or row.get('date')}"
+                    f"|{row.get('Time') or row.get('Saat') or row.get('time')}"
+                    f"|{row.get('Extension') or row.get('Dahili Numarası') or ''}"
+                )
+            )
+            if fp in seen_fingerprints:
+                continue
+            seen_fingerprints.add(fp)
+            all_rows.append(row)
+            new_count += 1
+
+        logger.info(
+            "Toniva conversations page=%s got=%s new=%s cumulative=%s meta_total=%s range=%s…%s",
+            page,
+            len(rows),
+            new_count,
+            len(all_rows),
+            meta_total,
+            start_date,
+            end_date,
+        )
+
+        if meta_total is not None and len(all_rows) >= meta_total:
+            break
+        # Tam sayfa gelmediyse son sayfa
+        if len(rows) < page_size:
+            break
+        # Yeni satır yoksa döngü (API aynı sayfayı tekrarlıyor)
+        if new_count == 0:
+            break
+
+    if meta_total is not None and len(all_rows) < meta_total:
+        logger.warning(
+            "Toniva conversations eksik olabilir: fetched=%s meta_total=%s (%s…%s)",
+            len(all_rows),
+            meta_total,
+            start_date,
+            end_date,
+        )
+    return all_rows
+
+
 def fetch_conversations(
     company_code: str,
     start_date: date,
@@ -1075,88 +1195,107 @@ def fetch_conversations(
     *,
     timeout: int = 30,
     include_zero_duration: bool = True,
+    force_day_chunk: bool | None = None,
 ) -> list[dict[str, Any]]:
+    """GET /reports/conversations — personel eşlemesi için tam CDR/görüşme.
+
+    - Zorunlu sayfalama (pageSize varsayılan 5000)
+    - 1 günden uzun aralıkta GÜN GÜN çekim (tek istekte 5000 cap + varsayılan 30 bug'ı)
+    - include_zero_duration: cevapsız dış arama (Görüşme Süresi=0) için minCall/Ring=0
+    """
     del company_code
-    all_rows: list[dict[str, Any]] = []
+    if end_date < start_date:
+        start_date, end_date = end_date, start_date
+
     min_call = 0 if include_zero_duration else None
     min_ring = 0 if include_zero_duration else None
 
-    # 1) OpenAPI önerisi: pageSize olmadan tüm pencere (max 5000)
-    rows, meta = fetch_report(
-        "conversations",
-        start_date,
-        end_date,
-        min_call_duration=min_call,
-        min_ring_duration=min_ring,
-        timeout=timeout,
+    span_days = (end_date - start_date).days
+    # Excel: tek günde ~6800 satır → multi-day mutlaka chunk
+    if force_day_chunk is None:
+        force_day_chunk = span_days >= 1
+
+    raw_all: list[dict[str, Any]] = []
+
+    if force_day_chunk and span_days >= 1:
+        day = start_date
+        while day <= end_date:
+            try:
+                day_rows = _fetch_conversations_pages(
+                    day,
+                    day,
+                    min_call_duration=min_call,
+                    min_ring_duration=min_ring,
+                    timeout=timeout,
+                )
+                # min=0 boş/az dönerse paramsız da dene ve birleştir
+                if include_zero_duration and len(day_rows) < 100:
+                    try:
+                        plain = _fetch_conversations_pages(
+                            day,
+                            day,
+                            min_call_duration=None,
+                            min_ring_duration=None,
+                            timeout=timeout,
+                        )
+                        if len(plain) > len(day_rows):
+                            # ikisini birleştir (fingerprint _fetch içinde yok; normalize sonrası)
+                            day_rows = day_rows + plain
+                    except Exception:
+                        pass
+                raw_all.extend(day_rows)
+                logger.info(
+                    "Toniva conversations gün=%s satır=%s",
+                    day.isoformat(),
+                    len(day_rows),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Toniva conversations gün başarısız %s: %s",
+                    day.isoformat(),
+                    exc,
+                )
+            day += timedelta(days=1)
+    else:
+        raw_all = _fetch_conversations_pages(
+            start_date,
+            end_date,
+            min_call_duration=min_call,
+            min_ring_duration=min_ring,
+            timeout=timeout,
+        )
+        if include_zero_duration and len(raw_all) < 100:
+            try:
+                plain = _fetch_conversations_pages(
+                    start_date,
+                    end_date,
+                    min_call_duration=None,
+                    min_ring_duration=None,
+                    timeout=timeout,
+                )
+                if len(plain) > len(raw_all):
+                    raw_all = raw_all + plain
+            except Exception:
+                pass
+
+    normalized = [normalize_conversation_row(r) for r in raw_all]
+    # Normalize sonrası telefon+dahili dolu satır sayısı (teşhis)
+    usable = sum(
+        1
+        for r in normalized
+        if (r.get("Phone") or r.get("phone"))
+        and (r.get("Extension") or r.get("ExtensionName"))
     )
-    all_rows.extend(rows)
-    truncated = bool(meta.get("truncated"))
-
-    # 2) truncated veya tam sayfa şüphesi → sayfalı devam
-    if truncated or len(rows) >= 5000:
-        page = 2
-        page_size = 5000
-        # İlk sayfayı pageSize ile yeniden çekme; devam sayfalarından ekle
-        # truncated true ise ilk batch zaten cap'li olabilir — page=1 pageSize ile yenile
-        if truncated and len(rows) < 5000:
-            rows_p1, meta = fetch_report(
-                "conversations",
-                start_date,
-                end_date,
-                page=1,
-                page_size=page_size,
-                min_call_duration=min_call,
-                min_ring_duration=min_ring,
-                timeout=timeout,
-            )
-            all_rows = list(rows_p1)
-            page = 2
-
-        while page <= 50:
-            rows_page, meta = fetch_report(
-                "conversations",
-                start_date,
-                end_date,
-                page=page,
-                page_size=page_size,
-                min_call_duration=min_call,
-                min_ring_duration=min_ring,
-                timeout=timeout,
-            )
-            if not rows_page:
-                break
-            all_rows.extend(rows_page)
-            total = meta.get("total_count") or meta.get("totalCount")
-            if total is not None:
-                try:
-                    if len(all_rows) >= int(total):
-                        break
-                except (TypeError, ValueError):
-                    pass
-            if len(rows_page) < page_size:
-                break
-            if meta.get("truncated") and page >= 50:
-                break
-            page += 1
-        else:
-            logger.warning("Toniva conversations 50 sayfa sınırına ulaştı.")
-
-        if meta.get("truncated") or truncated:
-            logger.warning(
-                "Toniva conversations truncated (start=%s end=%s, fetched=%s)",
-                start_date,
-                end_date,
-                len(all_rows),
-            )
-
     logger.info(
-        "Toniva conversations: %s satır (%s … %s)",
-        len(all_rows),
+        "Toniva conversations SONUÇ: raw=%s normalized=%s usable_phone_ext=%s (%s … %s) zero_dur=%s",
+        len(raw_all),
+        len(normalized),
+        usable,
         start_date,
         end_date,
+        include_zero_duration,
     )
-    return [normalize_conversation_row(r) for r in all_rows]
+    return normalized
 
 
 def get_available_queues(
@@ -1445,17 +1584,13 @@ def build_phone_dahili_cache(
 ) -> dict[str, str]:
     """Son N günden telefon → son dahili eşlemesi.
 
-    Gerçek kök neden analizi:
-    - UI 'Detaylı Arama Logları (CDR)' ≠ her zaman /reports/conversations içeriği
-    - Cevapsız dış arama (görüşme 00:00:00) conversations'ta yok sayılabilir
-    - minCallDuration=0 queue-detail'i bozup cache'i tamamen boşaltabiliyordu
-    - Yanıt tablo (columns+rows) veya farklı alan adlarıyla gelebilir
+    Excel kanıtı (gorusme_20260721): 1 günde ~6845 satır, çoğunluk Dış Arama,
+    Görüşme Süresi=0, Dahili Numarası dolu. Eşleme için conversations TAM çekilmeli.
 
     Strateji:
-    1) conversations + queue-detail (paramsız, güvenli)
-    2) conversations için ek minDuration=0 denemesi
-    3) Truncation/boşlukta gün gün conversations
-    4) Her ham satırda şema-bağımsız heuristic + normalizer
+    1) conversations: gün-gün + zorunlu pageSize sayfalama + zero-duration
+    2) queue-detail yedek (minDuration yok)
+    3) Ham satır heuristic + normalize
     """
     del company_code  # imza uyumu; Toniva API key ile çalışır
     end_date = _report_today()
@@ -1463,121 +1598,68 @@ def build_phone_dahili_cache(
     start_date = end_date - timedelta(days=days)
     phone_best: dict[str, tuple[datetime, str]] = {}
     sample_raw_keys: list[str] = []
-    raw_total = 0
+    conv_total = 0
+    qd_total = 0
 
-    def _consume_raw(raw_rows: list[dict[str, Any]]) -> None:
-        nonlocal raw_total, sample_raw_keys
-        for raw in raw_rows:
-            if not isinstance(raw, dict):
-                continue
-            raw_total += 1
-            if not sample_raw_keys:
-                sample_raw_keys = list(raw.keys())[:30]
-            _ingest_raw_record_for_cache(phone_best, raw)
-
-    # --- 1) conversations tam pencere ---
-    conv_n = 0
-    conv0_n = 0
+    # --- 1) conversations (asıl kaynak — Excel ile aynı rapor) ---
     try:
         conv = fetch_conversations(
             "toniva",
             start_date,
             end_date,
             timeout=timeout,
-            include_zero_duration=False,
+            include_zero_duration=True,
+            force_day_chunk=True,
         )
-        conv_n = len(conv)
+        conv_total = len(conv)
         for rec in conv:
             _ingest_phone_dahili_hit(phone_best, rec)
+            if not sample_raw_keys and isinstance(rec, dict):
+                sample_raw_keys = list(rec.keys())[:30]
     except Exception as exc:
-        logger.warning("Toniva conversations (paramsız) cache başarısız: %s", exc)
+        logger.warning("Toniva conversations cache başarısız: %s", exc)
 
-    # Sıfır süreli (CDR dış arama) için ayrı geçiş — 400 olursa base bozulmasın
+    # --- 2) queue-detail yedek ---
     try:
-        conv0 = fetch_conversations(
-            "toniva",
-            start_date,
-            end_date,
-            timeout=timeout,
-            include_zero_duration=True,
-        )
-        conv0_n = len(conv0)
-        for rec in conv0:
-            _ingest_phone_dahili_hit(phone_best, rec)
-    except Exception as exc:
-        logger.info("Toniva conversations minDuration=0 atlandı: %s", exc)
-
-    logger.info(
-        "Toniva cache conversations: base=%s zero_dur=%s",
-        conv_n,
-        conv0_n,
-    )
-
-    # --- 2) queue-detail (minDuration YOK — 400 riski) ---
-    try:
-        qd_rows = _safe_fetch_report_rows(
-            "queue-detail",
-            start_date,
-            end_date,
-            timeout=timeout,
-            try_zero_duration=False,
-        )
-        _consume_raw(qd_rows)
-        logger.info("Toniva cache queue-detail raw=%s", len(qd_rows))
-    except Exception as exc:
-        logger.warning("Toniva queue-detail cache başarısız: %s", exc)
-
-    # --- 3) Hâlâ zayıfsa: gün gün conversations (5000 cap kaçırma) ---
-    if len(phone_best) < 3:
-        logger.info(
-            "Toniva cache zayıf (%s numara); gün-gün conversations deneniyor.",
-            len(phone_best),
-        )
-        for offset in range(days + 1):
-            day = end_date - timedelta(days=offset)
+        # Gün gün — 15 günde 5000 cap riski
+        day = start_date
+        while day <= end_date:
             try:
-                day_rows = fetch_conversations(
-                    "toniva",
-                    day,
-                    day,
-                    timeout=timeout,
-                    include_zero_duration=True,
-                )
-                for rec in day_rows:
-                    _ingest_phone_dahili_hit(phone_best, rec)
-            except Exception as exc:
-                logger.warning(
-                    "Toniva günlük conversations başarısız (%s): %s",
-                    day.isoformat(),
-                    exc,
-                )
-            try:
-                raw_day = _safe_fetch_report_rows(
+                qd_rows = _safe_fetch_report_rows(
                     "queue-detail",
                     day,
                     day,
                     timeout=timeout,
                     try_zero_duration=False,
                 )
-                _consume_raw(raw_day)
-            except Exception:
-                pass
+                qd_total += len(qd_rows)
+                for raw in qd_rows:
+                    if isinstance(raw, dict):
+                        if not sample_raw_keys:
+                            sample_raw_keys = list(raw.keys())[:30]
+                        _ingest_raw_record_for_cache(phone_best, raw)
+            except Exception as exc:
+                logger.warning("queue-detail gün %s: %s", day, exc)
+            day += timedelta(days=1)
+    except Exception as exc:
+        logger.warning("Toniva queue-detail cache başarısız: %s", exc)
 
     cache = {phone: dahili for phone, (_, dahili) in phone_best.items()}
     logger.info(
-        "Toniva dahili cache: %s numara | ham_satir=%s keys_ornek=%s aralik=%s…%s",
+        "Toniva dahili cache: %s numara | conv=%s qd=%s keys=%s aralik=%s…%s",
         len(cache),
-        raw_total,
+        conv_total,
+        qd_total,
         sample_raw_keys or "(yok)",
         start_date,
         end_date,
     )
-    if not cache:
+    if len(cache) < 10:
         logger.warning(
-            "Toniva dahili cache BOŞ — personel eşlemesi yapılamaz. "
-            "Örnek ham alan adları: %s. "
-            "UI CDR satırları API conversations/queue-detail içinde yoksa "
-            "eşleme imkânsızdır (public API'de ayrı CDR endpoint yok).",
+            "Toniva dahili cache zayıf (%s). conv=%s sample_keys=%s. "
+            "API hâlâ az satır dönüyorsa pageSize/tenant kontrol edin.",
+            len(cache),
+            conv_total,
             sample_raw_keys or "(yok)",
         )
     return cache

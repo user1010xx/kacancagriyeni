@@ -286,8 +286,8 @@ def test_build_phone_dahili_cache_merges_queue_detail_and_conversations():
     assert cache.get(_normalize_phone("905412084627")) == "622"
 
 
-def test_build_phone_dahili_cache_tries_zero_duration_and_plain():
-    """Cache hem paramsız hem minDuration=0 conversations dener."""
+def test_build_phone_dahili_cache_uses_forced_pagination():
+    """Conversations ZORUNLU page+pageSize ile çekilmeli (varsayılan 30 bug'ı)."""
     from toniva_client import build_phone_dahili_cache
 
     calls: list[dict] = []
@@ -300,13 +300,117 @@ def test_build_phone_dahili_cache_tries_zero_duration_and_plain():
         build_phone_dahili_cache("toniva", days=1)
 
     conv_calls = [c for c in calls if c["slug"] == "conversations"]
-    assert len(conv_calls) >= 2
-    # en az birinde min duration 0 olmalı (sıfır süreli CDR)
+    assert conv_calls
+    # En az bir istekte explicit pagination
+    assert any(c.get("page") == 1 and c.get("page_size") for c in conv_calls)
+    # zero-duration için minCallDuration=0
     assert any(c.get("min_call_duration") == 0 for c in conv_calls)
-    # queue-detail minDuration ile bozulmamalı (paramsız)
+    # queue-detail minDuration ile bozulmamalı
     qd = [c for c in calls if c["slug"] == "queue-detail"]
     assert qd
     assert all(c.get("min_call_duration") is None for c in qd)
+
+
+def test_fetch_conversations_paginates_beyond_default_30():
+    """pageSize dolu sayfalar bitene kadar devam — 30 satırda takılmaz."""
+    from datetime import date as d
+    from toniva_client import fetch_conversations
+
+    pages: list[int] = []
+
+    def fake_fetch(slug, start_date, end_date, **kwargs):
+        assert slug == "conversations"
+        page = kwargs.get("page") or 1
+        page_size = kwargs.get("page_size") or 5000
+        pages.append(page)
+        if page == 1:
+            rows = [
+                {
+                    "Phone": f"905550000{i:03d}",
+                    "Extension": "608",
+                    "ExtensionName": "selcuk",
+                    "Date": "2026-07-21",
+                    "Time": f"10:{i:02d}:00",
+                }
+                for i in range(page_size)
+            ]
+            return rows, {"total_count": page_size + 10}
+        if page == 2:
+            rows = [
+                {
+                    "Phone": f"905551000{i:03d}",
+                    "Extension": "622",
+                    "ExtensionName": "seda",
+                    "Date": "2026-07-21",
+                    "Time": f"11:{i:02d}:00",
+                }
+                for i in range(10)
+            ]
+            return rows, {"total_count": page_size + 10}
+        return [], {"total_count": page_size + 10}
+
+    with patch("toniva_client.fetch_report", side_effect=fake_fetch):
+        rows = fetch_conversations(
+            "toniva",
+            d(2026, 7, 21),
+            d(2026, 7, 21),
+            include_zero_duration=True,
+            force_day_chunk=False,
+        )
+
+    assert 1 in pages and 2 in pages
+    assert len(rows) == 5000 + 10
+
+
+def test_extract_rows_prefers_longest_list():
+    """Özet 30 + asıl 100 satır varsa 100 seçilir."""
+    from toniva_client import _extract_rows
+
+    body = {
+        "summary": [{"id": i} for i in range(30)],
+        "data": {
+            "calls": [
+                {
+                    "Phone": f"90555{i:07d}",
+                    "Extension": "585",
+                    "Date": "2026-07-21",
+                    "Time": "12:00:00",
+                }
+                for i in range(100)
+            ]
+        },
+        "meta": {"total_count": 100},
+    }
+    rows = _extract_rows(body)
+    assert len(rows) == 100
+
+
+def test_excel_export_style_headers_map_to_cache():
+    """Excel gorusme export sütunları (Title Case TR) → cache."""
+    from invekto_client import _normalize_phone
+    from toniva_client import build_phone_dahili_cache
+
+    excel_row = {
+        "Yön": "Dış Arama",
+        "Dahili Adı": "selen",
+        "Dahili Numarası": "585",
+        "Telefon": "905352198619",
+        "Tarih": "2026-07-21",
+        "Saat": "11:12:29",
+        "Çaldırma Süresi": 5,
+        "Görüşme Süresi": 0,
+        "Hat": "903129950469",
+    }
+
+    def fake_fetch(slug, start_date, end_date, **kwargs):
+        if slug == "conversations":
+            return [excel_row], {"total_count": 1}
+        return [], {}
+
+    with patch("toniva_client.fetch_report", side_effect=fake_fetch):
+        cache = build_phone_dahili_cache("toniva", days=0)
+
+    assert cache.get(_normalize_phone("905352198619")) == "585"
 
 
 def test_extract_rows_columns_matrix_format():
