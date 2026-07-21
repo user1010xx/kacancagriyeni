@@ -91,6 +91,19 @@ personnel_store = PersonnelStore(DATA_DIR / "personnels.json")
 delivered_store = DeliveredStore(DATA_DIR / "delivered_calls.json", retention_hours=24)
 _MISSED_CALL_PROCESS_LOCK = asyncio.Lock()
 _GONDER_RUNNING = False
+_GONDER_CANCEL = False
+
+# /gonder durdur | stop | iptal | cancel
+_GONDER_STOP_TOKENS = frozenset(
+    {
+        "durdur",
+        "stop",
+        "iptal",
+        "cancel",
+        "iptal et",
+        "dur",
+    }
+)
 
 # Dahili cache: her poll'da PBX'e 15 günlük görüşme sorgusu atmaktan kaçınmak için
 # 5 dakikalık TTL ile önbelleğe alınır. Telefon→dahili eşlemesi nadiren değişir.
@@ -130,6 +143,7 @@ HELP_TEXT = (
     "/kacancagri 15.06.2026, 25.06.2026 - Kaçan çağrı Excel raporu\n"
     "/iletilenkacancagri 28.06.2026 - İletilen çağrı Excel raporu\n"
     "/gonder 20.07.2026,21.07.2026 - Seçili günleri gruba+DM yeniden ilet\n"
+    "/gonder durdur - Çalışan /gonder işlemini durdur\n"
     "/personelekle 105 Ahmet @ahmet - Tek personel ekle/güncelle\n"
     "/personelsil 105 - Personel sil\n"
     "/personeller - Kayıtlı personelleri listele\n\n"
@@ -684,12 +698,46 @@ async def kacancagri_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             export_path.unlink()
 
 
+def _is_gonder_stop_request(args: list[str] | None) -> bool:
+    """ /gonder durdur | stop | iptal | cancel """
+    if not args:
+        return False
+    joined = " ".join(str(a).strip() for a in args).strip().casefold()
+    if joined in _GONDER_STOP_TOKENS:
+        return True
+    # tek token: /gonder durdur
+    if len(args) == 1 and str(args[0]).strip().casefold() in _GONDER_STOP_TOKENS:
+        return True
+    return False
+
+
+def _request_gonder_cancel() -> str:
+    """Çalışan /gonder için iptal iste. Dönüş: kullanıcıya mesaj."""
+    global _GONDER_CANCEL
+    if not _GONDER_RUNNING:
+        return "ℹ️ Şu an çalışan bir /gonder işlemi yok."
+    _GONDER_CANCEL = True
+    logger.info("/gonder durdur istendi.")
+    return "🛑 Durdurma isteği alındı. Mevcut çağrı bittikten sonra /gonder duracak..."
+
+
+def _gonder_should_stop() -> bool:
+    return _GONDER_CANCEL
+
+
 async def gonder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Seçili günlerin kaçan çağrılarını dedup temizleyip sırayla yeniden iletir.
 
-    Kullanım: /gonder 20.07.2026,21.07.2026
+    Kullanım:
+      /gonder 20.07.2026,21.07.2026
+      /gonder durdur
     """
-    global _GONDER_RUNNING, _dahili_cache, _dahili_cache_built_at
+    global _GONDER_RUNNING, _GONDER_CANCEL, _dahili_cache, _dahili_cache_built_at
+
+    # --- Durdur ---
+    if _is_gonder_stop_request(context.args):
+        await update.message.reply_text(_request_gonder_cancel())
+        return
 
     company_code = _require_company_code()
     if not company_code:
@@ -698,7 +746,9 @@ async def gonder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if not context.args:
         await update.message.reply_text(
-            "Kullanım: /gonder 20.07.2026,21.07.2026\n"
+            "Kullanım:\n"
+            "• /gonder 20.07.2026,21.07.2026 — seçili günleri yeniden ilet\n"
+            "• /gonder durdur — çalışan iletimi durdur\n\n"
             "Belirtilen günlerin kaçan çağrıları gruba ve personele sırayla yeniden iletilir.\n"
             "⚠️ Aynı çağrılar için daha önce giden mesajlar varsa grupta çift bildirim olabilir."
         )
@@ -721,19 +771,23 @@ async def gonder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if _GONDER_RUNNING:
         await update.message.reply_text(
-            "⏳ /gonder zaten çalışıyor. Bitmesini bekleyin."
+            "⏳ /gonder zaten çalışıyor.\n"
+            "Durdurmak için: /gonder durdur"
         )
         return
 
     _GONDER_RUNNING = True
+    _GONDER_CANCEL = False
     date_labels = ", ".join(d.strftime("%d.%m.%Y") for d in target_dates)
     await update.message.reply_text(
         f"📤 Yeniden iletim başlıyor\n"
         f"Günler: {date_labels}\n"
         f"Önce dedup temizlenir, ardından çağrılar sırayla gruba ve personele gönderilir.\n"
+        f"Durdurmak için: /gonder durdur\n"
         f"Bu işlem birkaç dakika sürebilir..."
     )
 
+    cancelled = False
     try:
         # Taze personel eşlemesi için dahili cache'i zorla yenile
         _dahili_cache = {}
@@ -749,6 +803,13 @@ async def gonder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             cleared_delivered,
         )
 
+        if _gonder_should_stop():
+            cancelled = True
+            await update.message.reply_text(
+                "🛑 /gonder durduruldu (dedup temizliği sonrası, iletim başlamadan)."
+            )
+            return
+
         try:
             throttle = float(os.getenv("BACKFILL_THROTTLE_SECONDS", "0.15"))
         except ValueError:
@@ -760,6 +821,13 @@ async def gonder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         day_lines: list[str] = []
 
         for target in target_dates:
+            if _gonder_should_stop():
+                cancelled = True
+                day_lines.append(
+                    f"• {target.strftime('%d.%m.%Y')}: atlandı (durduruldu)"
+                )
+                break
+
             label = target.strftime("%d.%m.%Y")
             try:
                 sent_now, failed_dm = await _process_missed_calls_for_date(
@@ -767,6 +835,7 @@ async def gonder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     target,
                     context=context,
                     throttle_seconds=throttle,
+                    should_cancel=_gonder_should_stop,
                 )
             except Exception as exc:
                 logger.exception("/gonder gün işlenemedi: %s", label)
@@ -775,6 +844,14 @@ async def gonder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
             total_sent += sent_now
             total_failed_dm += failed_dm
+            if _gonder_should_stop():
+                cancelled = True
+                day_lines.append(
+                    f"• {label}: kısmi tamamlanan={sent_now}, "
+                    f"başarısız_dm={failed_dm} (durduruldu)"
+                )
+                break
+
             day_lines.append(
                 f"• {label}: tamamlanan={sent_now}, başarısız_dm={failed_dm}"
             )
@@ -785,18 +862,30 @@ async def gonder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 failed_dm,
             )
 
-        summary = (
-            f"✅ Yeniden iletim bitti\n"
-            f"Günler: {date_labels}\n"
-            f"Temizlenen dedup: {cleared_dedup}\n"
-            f"Temizlenen iletilen kayıt: {cleared_delivered}\n"
-            f"Toplam tamamlanan bildirim: {total_sent}\n"
-            f"Başarısız DM: {total_failed_dm}\n\n"
-            + "\n".join(day_lines)
-        )
+        if cancelled:
+            summary = (
+                f"🛑 Yeniden iletim DURDURULDU\n"
+                f"Günler: {date_labels}\n"
+                f"Temizlenen dedup: {cleared_dedup}\n"
+                f"Temizlenen iletilen kayıt: {cleared_delivered}\n"
+                f"Durana kadar tamamlanan bildirim: {total_sent}\n"
+                f"Başarısız DM: {total_failed_dm}\n\n"
+                + "\n".join(day_lines)
+            )
+        else:
+            summary = (
+                f"✅ Yeniden iletim bitti\n"
+                f"Günler: {date_labels}\n"
+                f"Temizlenen dedup: {cleared_dedup}\n"
+                f"Temizlenen iletilen kayıt: {cleared_delivered}\n"
+                f"Toplam tamamlanan bildirim: {total_sent}\n"
+                f"Başarısız DM: {total_failed_dm}\n\n"
+                + "\n".join(day_lines)
+            )
         await update.message.reply_text(summary)
     finally:
         _GONDER_RUNNING = False
+        _GONDER_CANCEL = False
 
 
 async def iletilenkacancagri_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -885,11 +974,19 @@ async def _process_missed_calls_for_date(
     context: ContextTypes.DEFAULT_TYPE | None = None,
     throttle_seconds: float = 0.0,
     after_time: str | None = None,
+    should_cancel=None,
 ) -> tuple[int, int]:
-    """Belirli bir günün kaçan çağrılarını işler. (bildirilen_sayı, başarısız_dm)"""
+    """Belirli bir günün kaçan çağrılarını işler. (bildirilen_sayı, başarısız_dm)
+
+    should_cancel: isteğe bağlı callable() -> bool; True olursa döngü kırılır
+    (/gonder durdur için).
+    """
     async with _MISSED_CALL_PROCESS_LOCK:
         company_code = _require_company_code()
         if not company_code:
+            return 0, 0
+
+        if should_cancel and should_cancel():
             return 0, 0
 
         sent_now = 0
@@ -922,6 +1019,9 @@ async def _process_missed_calls_for_date(
                 _update_bot_data(context, last_poll_error=str(exc))
             return 0, 0
 
+        if should_cancel and should_cancel():
+            return 0, 0
+
         calls = dedupe_calls_by_key(calls)
 
         cutoff = after_time or _cutoff_time_for_date(target_date)
@@ -934,11 +1034,21 @@ async def _process_missed_calls_for_date(
             _dahili_cache_built_at is None
             or (now_mono - _dahili_cache_built_at).total_seconds() > _DAHILI_CACHE_TTL_SECONDS
         ):
+            if should_cancel and should_cancel():
+                return 0, 0
             _dahili_cache = await asyncio.to_thread(build_phone_dahili_cache, company_code, 15)
             _dahili_cache_built_at = now_mono
         dahili_cache = _dahili_cache
 
         for call in calls:
+            if should_cancel and should_cancel():
+                logger.info(
+                    "Kaçan çağrı işleme iptal edildi (%s), şimdiye kadar sent=%s",
+                    target_date.isoformat(),
+                    sent_now,
+                )
+                break
+
             notify_ctx = build_missed_call_context(
                 call,
                 dahili_cache=dahili_cache,
