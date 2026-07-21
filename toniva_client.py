@@ -491,14 +491,28 @@ def normalize_queue_detail_row(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def normalize_conversation_row(record: dict[str, Any]) -> dict[str, Any]:
+    """Görüşme/CDR satırını botun beklediği forma çevirir.
+
+    queue-detail ile aynı Türkçe UI alanlarını da destekler
+    (TELEFON, DAHİLİ ADI, DAHİLİ NUMARASI, TARİH, SAAT, …).
+    Aksi halde telefon→dahili cache boş kalır ve tüm kaçan çağrılar
+    'personel bulunamadı' diye düşer.
+    """
     phone = _field(
         record,
         "Phone",
         "phone",
         "Caller",
         "caller",
+        "CallerNumber",
         "phoneNumber",
         "CalledNumber",
+        "calledNumber",
+        "Destination",
+        "destination",
+        "Telefon",
+        "telefon",
+        "TELEFON",
     )
     call_date_raw = _field(
         record,
@@ -507,6 +521,9 @@ def normalize_conversation_row(record: dict[str, Any]) -> dict[str, Any]:
         "ChekInDate",
         "CreateDate",
         "callDate",
+        "Tarih",
+        "tarih",
+        "TARİH",
     )
     call_time_raw = _field(
         record,
@@ -515,32 +532,58 @@ def normalize_conversation_row(record: dict[str, Any]) -> dict[str, Any]:
         "ChekInTime",
         "CreateTime",
         "callTime",
+        "Saat",
+        "saat",
+        "SAAT",
     )
+    # Tek datetime alanında birleşik gelebilir
+    if not call_time_raw and call_date_raw and "T" in str(call_date_raw):
+        call_time_raw = call_date_raw
+
+    # Dahili numarası (608) — UI: DAHİLİ NUMARASI
     extension = _field(
         record,
         "Extension",
         "extension",
         "CompletedExtension",
         "Dahili",
+        "dahili",
+        "DahiliNumarasi",
+        "Dahili Numarası",
+        "DAHİLİ NUMARASI",
+        "extensionNumber",
+        "ExtensionNumber",
     )
+    # Dahili adı (selcuk) — UI: DAHİLİ ADI
     extension_name = _field(
         record,
         "ExtensionName",
         "extensionName",
         "CompletedExtensionName",
         "Agent",
+        "agent",
         "Name",
         "DahiliAdi",
+        "dahiliAdi",
+        "dahili_adi",
+        "Dahili Adı",
+        "DAHİLİ ADI",
+        "User",
+        "DisplayName",
     )
+
+    call_date = _normalize_call_date(call_date_raw)
+    call_time = _normalize_time(call_time_raw)
+
     return {
         "Phone": phone,
         "phone": phone,
-        "Date": call_date_raw,
-        "Time": call_time_raw,
-        "ChekInDate": call_date_raw,
-        "CreateDate": call_date_raw,
-        "ChekInTime": call_time_raw,
-        "CreateTime": call_time_raw,
+        "Date": call_date or call_date_raw,
+        "Time": call_time or call_time_raw,
+        "ChekInDate": call_date or call_date_raw,
+        "CreateDate": call_date or call_date_raw,
+        "ChekInTime": call_time or call_time_raw,
+        "CreateTime": call_time or call_time_raw,
         "Extension": extension,
         "ExtensionName": extension_name,
         "CompletedExtension": extension,

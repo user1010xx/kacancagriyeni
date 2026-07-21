@@ -179,3 +179,59 @@ def test_normalize_conversation_row():
     assert row["Phone"] == "905551112233"
     assert row["Extension"] == "105"
     assert row["ExtensionName"] == "Ahmet"
+    assert row["ChekInDate"] == "18.07.2026"
+    assert row["ChekInTime"] == "09:15:00"
+
+
+def test_normalize_conversation_row_turkish_cdr_headers():
+    """UI/CDR tarzı Türkçe alanlar phone→dahili cache için kritik."""
+    row = normalize_conversation_row(
+        {
+            "YÖN": "Dış Arama",
+            "DAHİLİ ADI": "selcuk",
+            "DAHİLİ NUMARASI": "608",
+            "TELEFON": "905319598246",
+            "TARİH": "Salı 21 Temmuz 2026",
+            "SAAT": "11:54:34",
+            "GÖRÜŞME SÜRESİ": "00:00:00",
+        }
+    )
+    assert row["Phone"] == "905319598246"
+    assert row["Extension"] == "608"
+    assert row["ExtensionName"] == "selcuk"
+    assert row["ChekInDate"] == "21.07.2026"
+    assert row["ChekInTime"] == "11:54:34"
+
+
+def test_build_phone_dahili_cache_from_turkish_conversation_rows():
+    from datetime import date as date_cls
+    from invekto_client import _normalize_phone
+    from toniva_client import build_phone_dahili_cache
+
+    api_rows = [
+        {
+            "DAHİLİ ADI": "selcuk",
+            "DAHİLİ NUMARASI": "608",
+            "TELEFON": "905319598246",
+            "TARİH": "Salı 21 Temmuz 2026",
+            "SAAT": "11:54:34",
+        },
+        {
+            "phoneNumber": "905551112233",
+            "extension": "105",
+            "extensionName": "Ahmet",
+            "date": "2026-07-20",
+            "time": "10:00:00",
+        },
+    ]
+
+    with patch(
+        "toniva_client.fetch_report",
+        return_value=(api_rows, {}),
+    ):
+        cache = build_phone_dahili_cache("toniva", days=15)
+
+    phone_key = _normalize_phone("905319598246")
+    assert phone_key in cache
+    assert cache[phone_key] == "608"
+    assert cache[_normalize_phone("905551112233")] == "105"

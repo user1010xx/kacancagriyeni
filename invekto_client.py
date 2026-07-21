@@ -713,15 +713,26 @@ def enrich_delivered_rows_with_callback_status(
 
 
 def _extract_dahili_from_record(rec: dict[str, Any]) -> str:
-    return str(
-        rec.get("ExtensionName")
-        or rec.get("Extension")
-        or rec.get("CompletedExtensionName")
-        or rec.get("CompletedExtension")
-        or rec.get("extensionName")
-        or rec.get("extension")
-        or ""
-    ).strip()
+    """Kayıttan personel eşlemesi için dahili bilgisini çıkarır.
+
+    Öncelik: dahili numarası (608) — personel deposu genelde numara anahtarlı.
+    Yoksa dahili adı (selcuk). Boş string'ler atlanır.
+    """
+    candidates = (
+        rec.get("Extension"),
+        rec.get("extension"),
+        rec.get("CompletedExtension"),
+        rec.get("ExtensionName"),
+        rec.get("extensionName"),
+        rec.get("CompletedExtensionName"),
+        rec.get("Dahili"),
+        rec.get("dahili"),
+    )
+    for value in candidates:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
 
 
 def build_phone_dahili_cache(
