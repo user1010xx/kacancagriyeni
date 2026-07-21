@@ -50,6 +50,7 @@ from notifications import (
     lookup_dahili_from_cache,
     should_mark_complete,
 )
+from gonder_control import GonderControl
 from phone_map_store import PhoneMapStore, normalize_phone_key
 from sent_store import SentStore
 
@@ -92,12 +93,10 @@ sent_store = SentStore(DATA_DIR / "sent_calls.json")
 personnel_store = PersonnelStore(DATA_DIR / "personnels.json")
 delivered_store = DeliveredStore(DATA_DIR / "delivered_calls.json", retention_hours=24)
 phone_map_store = PhoneMapStore(DATA_DIR / "phone_map.json")
+gonder_control = GonderControl(DATA_DIR / "gonder_state.json")
 _MISSED_CALL_PROCESS_LOCK = asyncio.Lock()
-_GONDER_RUNNING = False
-_GONDER_CANCEL = False
-_GONDER_TASK: asyncio.Task | None = None
 
-# /gonder durdur | stop | iptal | cancel
+# /gonder durdur | stop | iptal | cancel | sessiz
 _GONDER_STOP_TOKENS = frozenset(
     {
         "durdur",
@@ -106,6 +105,15 @@ _GONDER_STOP_TOKENS = frozenset(
         "cancel",
         "iptal et",
         "dur",
+    }
+)
+_GONDER_SILENCE_TOKENS = frozenset(
+    {
+        "sessiz",
+        "sessizlestir",
+        "sessizleştir",
+        "silence",
+        "quiet",
     }
 )
 
@@ -148,6 +156,7 @@ HELP_TEXT = (
     "/iletilenkacancagri 28.06.2026 - İletilen çağrı Excel raporu\n"
     "/gonder 20.07.2026,21.07.2026 - Seçili günleri gruba+DM yeniden ilet\n"
     "/gonder durdur - Çalışan /gonder işlemini durdur\n"
+    "/gonder sessiz - Kalan dedup'u bildirimsiz kapat (flood durdur)\n"
     "/eslestir 905352211581 585 - Telefon→dahili kalıcı eşle\n"
     "/debugeslesme 905352211581 - Eşleme teşhisi\n"
     "/personelekle 105 Ahmet @ahmet - Tek personel ekle/güncelle\n"
@@ -711,24 +720,52 @@ def _is_gonder_stop_request(args: list[str] | None) -> bool:
     joined = " ".join(str(a).strip() for a in args).strip().casefold()
     if joined in _GONDER_STOP_TOKENS:
         return True
-    # tek token: /gonder durdur
     if len(args) == 1 and str(args[0]).strip().casefold() in _GONDER_STOP_TOKENS:
         return True
     return False
 
 
-def _request_gonder_cancel() -> str:
-    """Çalışan /gonder için iptal iste. Dönüş: kullanıcıya mesaj."""
-    global _GONDER_CANCEL
-    if not _GONDER_RUNNING:
-        return "ℹ️ Şu an çalışan bir /gonder işlemi yok."
-    _GONDER_CANCEL = True
-    logger.info("/gonder durdur istendi.")
-    return "🛑 Durdurma isteği alındı. Mevcut çağrı bittikten sonra /gonder duracak..."
+def _is_gonder_silence_request(args: list[str] | None) -> bool:
+    if not args:
+        return False
+    joined = " ".join(str(a).strip() for a in args).strip().casefold()
+    return joined in _GONDER_SILENCE_TOKENS or (
+        len(args) == 1 and str(args[0]).strip().casefold() in _GONDER_SILENCE_TOKENS
+    )
 
 
 def _gonder_should_stop() -> bool:
-    return _GONDER_CANCEL
+    return gonder_control.should_stop()
+
+
+async def _silence_dates_without_notify(target_dates: list[date]) -> int:
+    """Belirtilen günlerin kaçan çağrılarını bildirimsiz complete işaretle (flood kes)."""
+    company_code = _require_company_code()
+    if not company_code:
+        return 0
+    silenced = 0
+    for target in target_dates:
+        try:
+            calls = await asyncio.to_thread(
+                fetch_missed_calls,
+                company_code,
+                target,
+                target,
+                uncompleted_only=False,
+                **_fetch_kwargs(),
+            )
+        except Exception as exc:
+            logger.warning("sessizlestir fetch başarısız %s: %s", target, exc)
+            continue
+        calls = dedupe_calls_by_key(calls)
+        for call in calls:
+            keys = call_key_variants(call)
+            if not sent_store.is_complete_any(keys):
+                sent_store.mark_complete_keys(keys, save=False)
+                silenced += 1
+    if silenced:
+        sent_store.flush()
+    return silenced
 
 
 async def _run_gonder_job(
@@ -739,7 +776,7 @@ async def _run_gonder_job(
     context: ContextTypes.DEFAULT_TYPE | None = None,
 ) -> None:
     """Arka planda /gonder işi — handler hemen döner ki /gonder durdur işlenebilsin."""
-    global _GONDER_RUNNING, _GONDER_CANCEL, _dahili_cache, _dahili_cache_built_at
+    global _dahili_cache, _dahili_cache_built_at
 
     date_labels = ", ".join(d.strftime("%d.%m.%Y") for d in target_dates)
     cancelled = False
@@ -765,9 +802,14 @@ async def _run_gonder_job(
 
         if _gonder_should_stop():
             cancelled = True
+            # Dedup açıldıysa poll flood olmasın
+            silenced = await _silence_dates_without_notify(target_dates)
             await bot.send_message(
                 chat_id=chat_id,
-                text="🛑 /gonder durduruldu (dedup temizliği sonrası, iletim başlamadan).",
+                text=(
+                    "🛑 /gonder durduruldu (iletim başlamadan).\n"
+                    f"Bildirimsiz kapatılan: {silenced}"
+                ),
             )
             return
 
@@ -794,6 +836,10 @@ async def _run_gonder_job(
                     throttle_seconds=throttle,
                     should_cancel=_gonder_should_stop,
                 )
+            except asyncio.CancelledError:
+                cancelled = True
+                day_lines.append(f"• {label}: iptal (CancelledError)")
+                raise
             except Exception as exc:
                 logger.exception("/gonder gün işlenemedi: %s", label)
                 day_lines.append(f"• {label}: hata — {exc}")
@@ -820,12 +866,14 @@ async def _run_gonder_job(
             )
 
         if cancelled:
+            # Kalanları bildirimsiz kapat — normal poll tekrar basmasın
+            silenced = await _silence_dates_without_notify(target_dates)
             summary = (
                 f"🛑 Yeniden iletim DURDURULDU\n"
                 f"Günler: {date_labels}\n"
                 f"Temizlenen dedup: {cleared_dedup}\n"
-                f"Temizlenen iletilen kayıt: {cleared_delivered}\n"
-                f"Durana kadar tamamlanan bildirim: {total_sent}\n"
+                f"Durana kadar bildirim: {total_sent}\n"
+                f"Bildirimsiz kapatılan (flood önlemi): {silenced}\n"
                 f"Başarısız DM: {total_failed_dm}\n\n"
                 + ("\n".join(day_lines) if day_lines else "• henüz gün işlenmedi")
             )
@@ -840,6 +888,19 @@ async def _run_gonder_job(
                 + "\n".join(day_lines)
             )
         await bot.send_message(chat_id=chat_id, text=summary)
+    except asyncio.CancelledError:
+        logger.info("/gonder task iptal edildi (CancelledError)")
+        try:
+            silenced = await _silence_dates_without_notify(target_dates)
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"🛑 /gonder iptal edildi.\n"
+                    f"Bildirimsiz kapatılan: {silenced}"
+                ),
+            )
+        except Exception:
+            pass
     except Exception:
         logger.exception("/gonder arka plan işi çöktü")
         try:
@@ -850,8 +911,7 @@ async def _run_gonder_job(
         except Exception:
             pass
     finally:
-        _GONDER_RUNNING = False
-        _GONDER_CANCEL = False
+        gonder_control.finish()
 
 
 async def gonder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -860,15 +920,34 @@ async def gonder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     Kullanım:
       /gonder 20.07.2026,21.07.2026
       /gonder durdur
-
-    ÖNEMLİ: İş arka planda çalışır; handler hemen döner.
-    Böylece /gonder durdur aynı anda işlenebilir (PTB sıralı update kilidi kırılır).
+      /gonder sessiz
     """
-    global _GONDER_RUNNING, _GONDER_CANCEL, _GONDER_TASK
-
-    # --- Durdur (önce ve hızlı) ---
+    # --- Durdur ---
     if _is_gonder_stop_request(context.args):
-        await update.message.reply_text(_request_gonder_cancel())
+        _had, msg = gonder_control.request_cancel()
+        logger.info("/gonder durdur: had_job=%s", _had)
+        await update.message.reply_text(msg)
+        return
+
+    # --- Sessiz (flood acil kes) ---
+    if _is_gonder_silence_request(context.args):
+        gonder_control.request_cancel()
+        dates = gonder_control.active_dates()
+        if not dates:
+            # Son 2 gün (dün+bugün) varsayılan
+            today = _report_today()
+            dates = [today - timedelta(days=1), today]
+        await update.message.reply_text(
+            "🔇 Kalan kayıtlar bildirimsiz kapatılıyor..."
+        )
+        silenced = await _silence_dates_without_notify(dates)
+        gonder_control.finish()
+        await update.message.reply_text(
+            f"🔇 Sessizleştirme bitti.\n"
+            f"Günler: {', '.join(d.strftime('%d.%m.%Y') for d in dates)}\n"
+            f"Bildirimsiz kapatılan: {silenced}\n"
+            f"Poll artık bunları yeniden basmamalı."
+        )
         return
 
     company_code = _require_company_code()
@@ -880,9 +959,10 @@ async def gonder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(
             "Kullanım:\n"
             "• /gonder 20.07.2026,21.07.2026 — seçili günleri yeniden ilet\n"
-            "• /gonder durdur — çalışan iletimi durdur\n\n"
-            "Belirtilen günlerin kaçan çağrıları gruba ve personele sırayla yeniden iletilir.\n"
-            "⚠️ Aynı çağrılar için daha önce giden mesajlar varsa grupta çift bildirim olabilir."
+            "• /gonder durdur — çalışan iletimi durdur\n"
+            "• /gonder sessiz — kalanları bildirimsiz kapat (flood durdur)\n\n"
+            "⚠️ Dedup temizlenir; personel eşleşmezse 'bulunamadı' yağabilir.\n"
+            "Eşleme yoksa önce /eslestir kullanın."
         )
         return
 
@@ -901,27 +981,27 @@ async def gonder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    if _GONDER_RUNNING:
+    if gonder_control.is_running():
         await update.message.reply_text(
             "⏳ /gonder zaten çalışıyor.\n"
-            "Durdurmak için: /gonder durdur"
+            "Durdur: /gonder durdur\n"
+            "Flood kes: /gonder sessiz"
         )
         return
 
-    _GONDER_RUNNING = True
-    _GONDER_CANCEL = False
     date_labels = ", ".join(d.strftime("%d.%m.%Y") for d in target_dates)
     chat_id = update.effective_chat.id
+    gonder_control.begin(target_dates)
     await update.message.reply_text(
         f"📤 Yeniden iletim başlıyor (arka plan)\n"
         f"Günler: {date_labels}\n"
-        f"Önce dedup temizlenir, ardından çağrılar sırayla gruba ve personele gönderilir.\n"
-        f"⛔ Durdurmak için hemen yazın: /gonder durdur\n"
+        f"⛔ Durdur: /gonder durdur\n"
+        f"🔇 Flood kes: /gonder sessiz\n"
         f"Bu işlem birkaç dakika sürebilir..."
     )
 
-    # Handler hemen bitsin → /gonder durdur sıraya girmeden işlensin
-    _GONDER_TASK = context.application.create_task(
+    # Handler hemen bitsin → /gonder durdur işlenebilsin
+    task = context.application.create_task(
         _run_gonder_job(
             context.bot,
             chat_id,
@@ -930,6 +1010,7 @@ async def gonder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         ),
         update=update,
     )
+    gonder_control.attach_task(task)
 
 
 async def eslestir_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1264,6 +1345,15 @@ async def _process_missed_calls_for_date(
 
 
 async def poll_missed_calls(context: ContextTypes.DEFAULT_TYPE) -> None:
+    # /gonder çalışırken poll basmasın (dedup temizlenince flood olmasın)
+    if gonder_control.is_running() or gonder_control.should_stop():
+        logger.info(
+            "Poll atlandı: /gonder aktif veya durduruluyor (running=%s cancel=%s)",
+            gonder_control.is_running(),
+            gonder_control.should_stop(),
+        )
+        return
+
     _purge_delivered_store_by_retention_window()
 
     sent_now, failed_dm = await _process_missed_calls_for_date(

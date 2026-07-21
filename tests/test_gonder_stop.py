@@ -1,6 +1,9 @@
 """ /gonder durdur yardımcıları """
 
+from datetime import date
+
 import bot as bot_module
+from gonder_control import GonderControl
 
 
 def test_is_gonder_stop_request_variants():
@@ -15,25 +18,29 @@ def test_is_gonder_stop_request_variants():
     assert not bot_module._is_gonder_stop_request(["20.07.2026", "21.07.2026"])
 
 
-def test_request_gonder_cancel_when_idle():
-    bot_module._GONDER_RUNNING = False
-    bot_module._GONDER_CANCEL = False
-    msg = bot_module._request_gonder_cancel()
-    assert "yok" in msg.casefold() or "çalışan" in msg.casefold()
-    assert bot_module._GONDER_CANCEL is False
+def test_is_gonder_silence_request():
+    assert bot_module._is_gonder_silence_request(["sessiz"])
+    assert bot_module._is_gonder_silence_request(["silence"])
+    assert not bot_module._is_gonder_silence_request(["durdur"])
 
 
-def test_request_gonder_cancel_when_running():
-    bot_module._GONDER_RUNNING = True
-    bot_module._GONDER_CANCEL = False
-    try:
-        msg = bot_module._request_gonder_cancel()
-        assert "durdur" in msg.casefold() or "🛑" in msg
-        assert bot_module._GONDER_CANCEL is True
-        assert bot_module._gonder_should_stop() is True
-    finally:
-        bot_module._GONDER_RUNNING = False
-        bot_module._GONDER_CANCEL = False
+def test_gonder_control_cancel_when_idle(tmp_path):
+    ctrl = GonderControl(tmp_path / "gonder_state.json")
+    had, msg = ctrl.request_cancel()
+    assert had is False
+    assert "yok" in msg.casefold() or "sessiz" in msg.casefold()
+
+
+def test_gonder_control_cancel_when_running(tmp_path):
+    ctrl = GonderControl(tmp_path / "gonder_state.json")
+    ctrl.begin([date(2026, 7, 20), date(2026, 7, 21)])
+    assert ctrl.is_running() is True
+    had, msg = ctrl.request_cancel()
+    assert had is True
+    assert ctrl.should_stop() is True
+    assert "durdur" in msg.casefold() or "🛑" in msg
+    ctrl.finish()
+    assert ctrl.is_running() is False
 
 
 def test_lookup_dahili_from_cache_variants():
