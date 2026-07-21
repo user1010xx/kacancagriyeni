@@ -7,6 +7,35 @@ from zoneinfo import ZoneInfo
 
 from invekto_client import _call_datetime, _normalize_phone, call_key, call_key_variants
 
+
+def lookup_dahili_from_cache(dahili_cache: dict, phone: str) -> str | None:
+    """Cache'te telefon için dahili ara (çoklu anahtar varyantı)."""
+    if not dahili_cache or not phone:
+        return None
+    keys: list[str] = []
+    core = _normalize_phone(phone)
+    if core:
+        keys.append(core)
+    import re
+
+    digits = re.sub(r"\D", "", str(phone))
+    for candidate in (
+        digits,
+        digits[-10:] if len(digits) >= 10 else "",
+        digits[-9:] if len(digits) >= 9 else "",
+    ):
+        if candidate and candidate not in keys:
+            keys.append(candidate)
+    # ham anahtar da (normalize edilmeden yazılmış cache'ler)
+    raw = str(phone).strip()
+    if raw and raw not in keys:
+        keys.append(raw)
+    for key in keys:
+        val = dahili_cache.get(key)
+        if val:
+            return str(val).strip() or None
+    return None
+
 _REPORT_TZ = ZoneInfo("Europe/Istanbul")
 logger = logging.getLogger(__name__)
 
@@ -40,6 +69,7 @@ def build_missed_call_context(
     dahili_cache: dict[str, str],
     personnel_store,
     sent_store,
+    phone_map_store=None,
 ) -> MissedCallContext | None:
     key = call_key(call)
     key_variants = call_key_variants(call)
@@ -58,7 +88,14 @@ def build_missed_call_context(
     phone = str(call.get("Phone") or "")
     call_time_str = build_call_time_str(call)
 
-    dahili = dahili_cache.get(_normalize_phone(phone))
+    # 1) bellek cache  2) kalıcı phone_map  3) yoksa NO_DAHILI
+    dahili = lookup_dahili_from_cache(dahili_cache, phone)
+    if not dahili and phone_map_store is not None:
+        try:
+            dahili = phone_map_store.lookup(phone)
+        except Exception:
+            dahili = None
+
     if not dahili:
         return MissedCallContext(
             key=key,

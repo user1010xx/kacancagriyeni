@@ -47,8 +47,10 @@ from notifications import (
     build_missed_call_context,
     counts_as_failed_dm,
     deliver_missed_call_notification,
+    lookup_dahili_from_cache,
     should_mark_complete,
 )
+from phone_map_store import PhoneMapStore, normalize_phone_key
 from sent_store import SentStore
 
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data"))).resolve()
@@ -89,9 +91,11 @@ config = ConfigStore(DATA_DIR / "config.json")
 sent_store = SentStore(DATA_DIR / "sent_calls.json")
 personnel_store = PersonnelStore(DATA_DIR / "personnels.json")
 delivered_store = DeliveredStore(DATA_DIR / "delivered_calls.json", retention_hours=24)
+phone_map_store = PhoneMapStore(DATA_DIR / "phone_map.json")
 _MISSED_CALL_PROCESS_LOCK = asyncio.Lock()
 _GONDER_RUNNING = False
 _GONDER_CANCEL = False
+_GONDER_TASK: asyncio.Task | None = None
 
 # /gonder durdur | stop | iptal | cancel
 _GONDER_STOP_TOKENS = frozenset(
@@ -144,6 +148,8 @@ HELP_TEXT = (
     "/iletilenkacancagri 28.06.2026 - İletilen çağrı Excel raporu\n"
     "/gonder 20.07.2026,21.07.2026 - Seçili günleri gruba+DM yeniden ilet\n"
     "/gonder durdur - Çalışan /gonder işlemini durdur\n"
+    "/eslestir 905352211581 585 - Telefon→dahili kalıcı eşle\n"
+    "/debugeslesme 905352211581 - Eşleme teşhisi\n"
     "/personelekle 105 Ahmet @ahmet - Tek personel ekle/güncelle\n"
     "/personelsil 105 - Personel sil\n"
     "/personeller - Kayıtlı personelleri listele\n\n"
@@ -725,16 +731,142 @@ def _gonder_should_stop() -> bool:
     return _GONDER_CANCEL
 
 
+async def _run_gonder_job(
+    bot,
+    chat_id: int,
+    target_dates: list,
+    *,
+    context: ContextTypes.DEFAULT_TYPE | None = None,
+) -> None:
+    """Arka planda /gonder işi — handler hemen döner ki /gonder durdur işlenebilsin."""
+    global _GONDER_RUNNING, _GONDER_CANCEL, _dahili_cache, _dahili_cache_built_at
+
+    date_labels = ", ".join(d.strftime("%d.%m.%Y") for d in target_dates)
+    cancelled = False
+    cleared_dedup = 0
+    cleared_delivered = 0
+    total_sent = 0
+    total_failed_dm = 0
+    day_lines: list[str] = []
+
+    try:
+        _dahili_cache = {}
+        _dahili_cache_built_at = None
+
+        date_set = set(target_dates)
+        cleared_dedup = sent_store.unmark_for_dates(date_set)
+        cleared_delivered = delivered_store.remove_by_call_key_dates(date_set)
+        logger.info(
+            "/gonder dedup temizlendi: dates=%s removed_dedup=%s removed_delivered=%s",
+            date_labels,
+            cleared_dedup,
+            cleared_delivered,
+        )
+
+        if _gonder_should_stop():
+            cancelled = True
+            await bot.send_message(
+                chat_id=chat_id,
+                text="🛑 /gonder durduruldu (dedup temizliği sonrası, iletim başlamadan).",
+            )
+            return
+
+        try:
+            throttle = float(os.getenv("BACKFILL_THROTTLE_SECONDS", "0.15"))
+        except ValueError:
+            throttle = 0.15
+        throttle = max(0.0, throttle)
+
+        for target in target_dates:
+            if _gonder_should_stop():
+                cancelled = True
+                day_lines.append(
+                    f"• {target.strftime('%d.%m.%Y')}: atlandı (durduruldu)"
+                )
+                break
+
+            label = target.strftime("%d.%m.%Y")
+            try:
+                sent_now, failed_dm = await _process_missed_calls_for_date(
+                    bot,
+                    target,
+                    context=context,
+                    throttle_seconds=throttle,
+                    should_cancel=_gonder_should_stop,
+                )
+            except Exception as exc:
+                logger.exception("/gonder gün işlenemedi: %s", label)
+                day_lines.append(f"• {label}: hata — {exc}")
+                continue
+
+            total_sent += sent_now
+            total_failed_dm += failed_dm
+            if _gonder_should_stop():
+                cancelled = True
+                day_lines.append(
+                    f"• {label}: kısmi tamamlanan={sent_now}, "
+                    f"başarısız_dm={failed_dm} (durduruldu)"
+                )
+                break
+
+            day_lines.append(
+                f"• {label}: tamamlanan={sent_now}, başarısız_dm={failed_dm}"
+            )
+            logger.info(
+                "/gonder gün bitti: %s sent=%s failed_dm=%s",
+                label,
+                sent_now,
+                failed_dm,
+            )
+
+        if cancelled:
+            summary = (
+                f"🛑 Yeniden iletim DURDURULDU\n"
+                f"Günler: {date_labels}\n"
+                f"Temizlenen dedup: {cleared_dedup}\n"
+                f"Temizlenen iletilen kayıt: {cleared_delivered}\n"
+                f"Durana kadar tamamlanan bildirim: {total_sent}\n"
+                f"Başarısız DM: {total_failed_dm}\n\n"
+                + ("\n".join(day_lines) if day_lines else "• henüz gün işlenmedi")
+            )
+        else:
+            summary = (
+                f"✅ Yeniden iletim bitti\n"
+                f"Günler: {date_labels}\n"
+                f"Temizlenen dedup: {cleared_dedup}\n"
+                f"Temizlenen iletilen kayıt: {cleared_delivered}\n"
+                f"Toplam tamamlanan bildirim: {total_sent}\n"
+                f"Başarısız DM: {total_failed_dm}\n\n"
+                + "\n".join(day_lines)
+            )
+        await bot.send_message(chat_id=chat_id, text=summary)
+    except Exception:
+        logger.exception("/gonder arka plan işi çöktü")
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text="❌ /gonder beklenmeyen hata ile durdu. Logları kontrol edin.",
+            )
+        except Exception:
+            pass
+    finally:
+        _GONDER_RUNNING = False
+        _GONDER_CANCEL = False
+
+
 async def gonder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Seçili günlerin kaçan çağrılarını dedup temizleyip sırayla yeniden iletir.
 
     Kullanım:
       /gonder 20.07.2026,21.07.2026
       /gonder durdur
-    """
-    global _GONDER_RUNNING, _GONDER_CANCEL, _dahili_cache, _dahili_cache_built_at
 
-    # --- Durdur ---
+    ÖNEMLİ: İş arka planda çalışır; handler hemen döner.
+    Böylece /gonder durdur aynı anda işlenebilir (PTB sıralı update kilidi kırılır).
+    """
+    global _GONDER_RUNNING, _GONDER_CANCEL, _GONDER_TASK
+
+    # --- Durdur (önce ve hızlı) ---
     if _is_gonder_stop_request(context.args):
         await update.message.reply_text(_request_gonder_cancel())
         return
@@ -779,113 +911,143 @@ async def gonder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     _GONDER_RUNNING = True
     _GONDER_CANCEL = False
     date_labels = ", ".join(d.strftime("%d.%m.%Y") for d in target_dates)
+    chat_id = update.effective_chat.id
     await update.message.reply_text(
-        f"📤 Yeniden iletim başlıyor\n"
+        f"📤 Yeniden iletim başlıyor (arka plan)\n"
         f"Günler: {date_labels}\n"
         f"Önce dedup temizlenir, ardından çağrılar sırayla gruba ve personele gönderilir.\n"
-        f"Durdurmak için: /gonder durdur\n"
+        f"⛔ Durdurmak için hemen yazın: /gonder durdur\n"
         f"Bu işlem birkaç dakika sürebilir..."
     )
 
-    cancelled = False
-    try:
-        # Taze personel eşlemesi için dahili cache'i zorla yenile
-        _dahili_cache = {}
-        _dahili_cache_built_at = None
+    # Handler hemen bitsin → /gonder durdur sıraya girmeden işlensin
+    _GONDER_TASK = context.application.create_task(
+        _run_gonder_job(
+            context.bot,
+            chat_id,
+            target_dates,
+            context=context,
+        ),
+        update=update,
+    )
 
-        date_set = set(target_dates)
-        cleared_dedup = sent_store.unmark_for_dates(date_set)
-        cleared_delivered = delivered_store.remove_by_call_key_dates(date_set)
-        logger.info(
-            "/gonder dedup temizlendi: dates=%s removed_dedup=%s removed_delivered=%s",
-            date_labels,
-            cleared_dedup,
-            cleared_delivered,
+
+async def eslestir_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manuel telefon → dahili kalıcı eşleme.
+
+    Kullanım: /eslestir 905352211581 585
+             /eslestir 905352211581 selen
+    """
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Kullanım: /eslestir <telefon> <dahili_no_veya_ad>\n"
+            "Örnek: /eslestir 905352211581 585\n"
+            "Örnek: /eslestir 905352211581 selen\n\n"
+            "Bu kayıt kalıcıdır (phone_map.json). UI CDR'da görünen ama "
+            "API'den gelmeyen dış aramalar için kullanın."
+        )
+        return
+
+    phone = context.args[0].strip()
+    dahili = " ".join(context.args[1:]).strip()
+    if not normalize_phone_key(phone):
+        await update.message.reply_text("Geçersiz telefon numarası.")
+        return
+    if not dahili:
+        await update.message.reply_text("Dahili boş olamaz.")
+        return
+
+    personnel = personnel_store.find_for_extension(dahili)
+    phone_map_store.set(phone, dahili)
+    # Bellek cache'i de güncelle
+    global _dahili_cache, _dahili_cache_built_at
+    pk = normalize_phone_key(phone)
+    _dahili_cache[pk] = dahili
+
+    if personnel:
+        ad = personnel.get("personel_adi", dahili)
+        await update.message.reply_text(
+            f"✅ Eşleme kaydedildi\n"
+            f"📞 {phone} → {dahili} ({ad})\n"
+            f"Personel kaydı bulundu; sonraki kaçan çağrılarda DM+grup gidecek."
+        )
+    else:
+        await update.message.reply_text(
+            f"⚠️ Eşleme kaydedildi: {phone} → {dahili}\n"
+            f"Ancak personel listesinde '{dahili}' bulunamadı.\n"
+            f"/personelekle ile ekleyin veya dahili numarasını kontrol edin."
         )
 
-        if _gonder_should_stop():
-            cancelled = True
-            await update.message.reply_text(
-                "🛑 /gonder durduruldu (dedup temizliği sonrası, iletim başlamadan)."
+
+async def debugeslesme_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Telefon eşleme teşhisi: cache, kalıcı map, API satır özeti."""
+    if not context.args:
+        await update.message.reply_text("Kullanım: /debugeslesme 905352211581")
+        return
+
+    phone = context.args[0].strip()
+    pk = normalize_phone_key(phone)
+    mem = lookup_dahili_from_cache(_dahili_cache, phone)
+    persistent = phone_map_store.lookup(phone)
+    personnel_mem = (
+        personnel_store.find_for_extension(mem) if mem else None
+    )
+    personnel_pers = (
+        personnel_store.find_for_extension(persistent) if persistent else None
+    )
+
+    lines = [
+        "🔎 Eşleme teşhisi\n",
+        f"Telefon: {phone}",
+        f"Normalize: {pk or '(boş)'}",
+        f"Bellek cache: {mem or 'YOK'} (cache boyutu={len(_dahili_cache)})",
+        f"Kalıcı map: {persistent or 'YOK'} (map boyutu={phone_map_store.count()})",
+        f"Personel(bellek): {personnel_mem.get('personel_adi') if personnel_mem else 'YOK'}",
+        f"Personel(kalıcı): {personnel_pers.get('personel_adi') if personnel_pers else 'YOK'}",
+    ]
+
+    company_code = _require_company_code()
+    if not company_code:
+        lines.append(f"\nPBX: {_pbx_not_ready_message()}")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    await update.message.reply_text("API sorgulanıyor (son 3 gün)...")
+    try:
+        end = _report_today()
+        start = end - timedelta(days=3)
+        rows = await asyncio.to_thread(fetch_conversations, company_code, start, end)
+        hits = [
+            r
+            for r in rows
+            if normalize_phone_key(str(r.get("Phone") or r.get("phone") or "")) == pk
+        ]
+        lines.append(f"\nAPI conversations ({start}…{end}): {len(rows)} satır")
+        lines.append(f"Bu telefon eşleşen: {len(hits)}")
+        if hits:
+            sample = hits[-1]
+            lines.append(
+                f"Son kayıt: Ext={sample.get('Extension')!r} "
+                f"Name={sample.get('ExtensionName')!r} "
+                f"Date={sample.get('Date') or sample.get('ChekInDate')!r} "
+                f"Time={sample.get('Time') or sample.get('ChekInTime')!r}"
             )
-            return
-
-        try:
-            throttle = float(os.getenv("BACKFILL_THROTTLE_SECONDS", "0.15"))
-        except ValueError:
-            throttle = 0.15
-        throttle = max(0.0, throttle)
-
-        total_sent = 0
-        total_failed_dm = 0
-        day_lines: list[str] = []
-
-        for target in target_dates:
-            if _gonder_should_stop():
-                cancelled = True
-                day_lines.append(
-                    f"• {target.strftime('%d.%m.%Y')}: atlandı (durduruldu)"
-                )
-                break
-
-            label = target.strftime("%d.%m.%Y")
-            try:
-                sent_now, failed_dm = await _process_missed_calls_for_date(
-                    context.bot,
-                    target,
-                    context=context,
-                    throttle_seconds=throttle,
-                    should_cancel=_gonder_should_stop,
-                )
-            except Exception as exc:
-                logger.exception("/gonder gün işlenemedi: %s", label)
-                day_lines.append(f"• {label}: hata — {exc}")
-                continue
-
-            total_sent += sent_now
-            total_failed_dm += failed_dm
-            if _gonder_should_stop():
-                cancelled = True
-                day_lines.append(
-                    f"• {label}: kısmi tamamlanan={sent_now}, "
-                    f"başarısız_dm={failed_dm} (durduruldu)"
-                )
-                break
-
-            day_lines.append(
-                f"• {label}: tamamlanan={sent_now}, başarısız_dm={failed_dm}"
-            )
-            logger.info(
-                "/gonder gün bitti: %s sent=%s failed_dm=%s",
-                label,
-                sent_now,
-                failed_dm,
-            )
-
-        if cancelled:
-            summary = (
-                f"🛑 Yeniden iletim DURDURULDU\n"
-                f"Günler: {date_labels}\n"
-                f"Temizlenen dedup: {cleared_dedup}\n"
-                f"Temizlenen iletilen kayıt: {cleared_delivered}\n"
-                f"Durana kadar tamamlanan bildirim: {total_sent}\n"
-                f"Başarısız DM: {total_failed_dm}\n\n"
-                + "\n".join(day_lines)
-            )
+        elif rows:
+            sample = rows[0]
+            lines.append(f"Örnek satır alanları: {list(sample.keys())[:15]}")
         else:
-            summary = (
-                f"✅ Yeniden iletim bitti\n"
-                f"Günler: {date_labels}\n"
-                f"Temizlenen dedup: {cleared_dedup}\n"
-                f"Temizlenen iletilen kayıt: {cleared_delivered}\n"
-                f"Toplam tamamlanan bildirim: {total_sent}\n"
-                f"Başarısız DM: {total_failed_dm}\n\n"
-                + "\n".join(day_lines)
+            lines.append(
+                "⚠️ API 0 satır döndü — UI CDR public API'de yok olabilir. "
+                "Manuel: /eslestir <tel> <dahili>"
             )
-        await update.message.reply_text(summary)
-    finally:
-        _GONDER_RUNNING = False
-        _GONDER_CANCEL = False
+    except Exception as exc:
+        lines.append(f"\nAPI hata: {exc}")
+
+    lines.append(
+        "\nManuel eşle: /eslestir "
+        f"{phone} <dahili>"
+    )
+    await update.message.reply_text("\n".join(lines))
 
 
 async def iletilenkacancagri_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1038,6 +1200,13 @@ async def _process_missed_calls_for_date(
                 return 0, 0
             _dahili_cache = await asyncio.to_thread(build_phone_dahili_cache, company_code, 15)
             _dahili_cache_built_at = now_mono
+            # API'den gelen eşlemeleri kalıcı depoya yaz
+            try:
+                merged = phone_map_store.merge(_dahili_cache)
+                if merged:
+                    logger.info("phone_map kalıcı depo güncellendi: +%s kayıt", merged)
+            except Exception as exc:
+                logger.warning("phone_map merge başarısız: %s", exc)
         dahili_cache = _dahili_cache
 
         for call in calls:
@@ -1054,6 +1223,7 @@ async def _process_missed_calls_for_date(
                 dahili_cache=dahili_cache,
                 personnel_store=personnel_store,
                 sent_store=sent_store,
+                phone_map_store=phone_map_store,
             )
             if notify_ctx is None:
                 continue
@@ -1316,6 +1486,8 @@ def main() -> None:
         Application.builder()
         .token(token)
         .post_init(post_init)
+        # /gonder çalışırken /gonder durdur'un işlenebilmesi için zorunlu
+        .concurrent_updates(True)
         .build()
     )
 
@@ -1335,6 +1507,8 @@ def main() -> None:
     application.add_handler(CommandHandler("kacancagri", kacancagri_command, filters=allowed))
     application.add_handler(CommandHandler("iletilenkacancagri", iletilenkacancagri_command, filters=allowed))
     application.add_handler(CommandHandler("gonder", gonder_command, filters=allowed))
+    application.add_handler(CommandHandler("eslestir", eslestir_command, filters=allowed))
+    application.add_handler(CommandHandler("debugeslesme", debugeslesme_command, filters=allowed))
     application.add_handler(CommandHandler("personelekle", personelekle_command, filters=allowed))
     application.add_handler(CommandHandler("personelsil", personelsil_command, filters=allowed))
     application.add_handler(CommandHandler("personeller", personeller_command, filters=allowed))

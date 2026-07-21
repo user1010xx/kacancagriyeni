@@ -87,6 +87,36 @@ def test_build_context_no_dahili(tmp_path):
     assert ctx.kind == NotifyKind.NO_DAHILI
 
 
+def test_build_context_uses_phone_map_store(tmp_path):
+    from phone_map_store import PhoneMapStore
+
+    sent = _FakeSentStore()
+    personnel = PersonnelStore(tmp_path / "p.json")
+    personnel.add_or_update("585", "Selen", "selen_tg")
+    pmap = PhoneMapStore(tmp_path / "phone_map.json")
+    pmap.set("905352211581", "585")
+    call = {
+        "ID": "2",
+        "Phone": "905352211581",
+        "ChekInDate": "2026-07-20",
+        "ChekInTime": "18:58:17",
+        "Queue": "1000",
+        "Status": "Cevapsız",
+    }
+    ctx = build_missed_call_context(
+        call,
+        dahili_cache={},  # bellek boş
+        personnel_store=personnel,
+        sent_store=sent,
+        phone_map_store=pmap,
+    )
+    assert ctx is not None
+    assert ctx.kind == NotifyKind.PERSONNEL
+    assert ctx.dahili == "585"
+    assert ctx.personnel is not None
+    assert ctx.personnel.get("personel_adi") == "Selen"
+
+
 def test_should_mark_complete_rules():
     ctx_personnel = type("C", (), {"kind": NotifyKind.PERSONNEL})()
     ctx_other = type("C", (), {"kind": NotifyKind.NO_DAHILI})()
