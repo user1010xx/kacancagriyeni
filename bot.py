@@ -38,6 +38,7 @@ from pbx_provider import (
     fetch_conversations,
     fetch_missed_calls,
     get_available_queues,
+    parse_command_date_list,
     parse_command_dates,
     split_calls_by_time,
 )
@@ -89,6 +90,7 @@ sent_store = SentStore(DATA_DIR / "sent_calls.json")
 personnel_store = PersonnelStore(DATA_DIR / "personnels.json")
 delivered_store = DeliveredStore(DATA_DIR / "delivered_calls.json", retention_hours=24)
 _MISSED_CALL_PROCESS_LOCK = asyncio.Lock()
+_GONDER_RUNNING = False
 
 # Dahili cache: her poll'da PBX'e 15 günlük görüşme sorgusu atmaktan kaçınmak için
 # 5 dakikalık TTL ile önbelleğe alınır. Telefon→dahili eşlemesi nadiren değişir.
@@ -127,6 +129,7 @@ HELP_TEXT = (
     "/kuyruklar - PBX kuyruk/departman listesi\n"
     "/kacancagri 15.06.2026, 25.06.2026 - Kaçan çağrı Excel raporu\n"
     "/iletilenkacancagri 28.06.2026 - İletilen çağrı Excel raporu\n"
+    "/gonder 20.07.2026,21.07.2026 - Seçili günleri gruba+DM yeniden ilet\n"
     "/personelekle 105 Ahmet @ahmet - Tek personel ekle/güncelle\n"
     "/personelsil 105 - Personel sil\n"
     "/personeller - Kayıtlı personelleri listele\n\n"
@@ -681,6 +684,121 @@ async def kacancagri_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             export_path.unlink()
 
 
+async def gonder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Seçili günlerin kaçan çağrılarını dedup temizleyip sırayla yeniden iletir.
+
+    Kullanım: /gonder 20.07.2026,21.07.2026
+    """
+    global _GONDER_RUNNING, _dahili_cache, _dahili_cache_built_at
+
+    company_code = _require_company_code()
+    if not company_code:
+        await update.message.reply_text(_pbx_not_ready_message())
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Kullanım: /gonder 20.07.2026,21.07.2026\n"
+            "Belirtilen günlerin kaçan çağrıları gruba ve personele sırayla yeniden iletilir.\n"
+            "⚠️ Aynı çağrılar için daha önce giden mesajlar varsa grupta çift bildirim olabilir."
+        )
+        return
+
+    try:
+        target_dates = parse_command_date_list(" ".join(context.args))
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return
+
+    today = _report_today()
+    future = [d for d in target_dates if d > today]
+    if future:
+        await update.message.reply_text(
+            "İleri tarih gönderilemez: "
+            + ", ".join(d.strftime("%d.%m.%Y") for d in future)
+        )
+        return
+
+    if _GONDER_RUNNING:
+        await update.message.reply_text(
+            "⏳ /gonder zaten çalışıyor. Bitmesini bekleyin."
+        )
+        return
+
+    _GONDER_RUNNING = True
+    date_labels = ", ".join(d.strftime("%d.%m.%Y") for d in target_dates)
+    await update.message.reply_text(
+        f"📤 Yeniden iletim başlıyor\n"
+        f"Günler: {date_labels}\n"
+        f"Önce dedup temizlenir, ardından çağrılar sırayla gruba ve personele gönderilir.\n"
+        f"Bu işlem birkaç dakika sürebilir..."
+    )
+
+    try:
+        # Taze personel eşlemesi için dahili cache'i zorla yenile
+        _dahili_cache = {}
+        _dahili_cache_built_at = None
+
+        date_set = set(target_dates)
+        cleared_dedup = sent_store.unmark_for_dates(date_set)
+        cleared_delivered = delivered_store.remove_by_call_key_dates(date_set)
+        logger.info(
+            "/gonder dedup temizlendi: dates=%s removed_dedup=%s removed_delivered=%s",
+            date_labels,
+            cleared_dedup,
+            cleared_delivered,
+        )
+
+        try:
+            throttle = float(os.getenv("BACKFILL_THROTTLE_SECONDS", "0.15"))
+        except ValueError:
+            throttle = 0.15
+        throttle = max(0.0, throttle)
+
+        total_sent = 0
+        total_failed_dm = 0
+        day_lines: list[str] = []
+
+        for target in target_dates:
+            label = target.strftime("%d.%m.%Y")
+            try:
+                sent_now, failed_dm = await _process_missed_calls_for_date(
+                    context.bot,
+                    target,
+                    context=context,
+                    throttle_seconds=throttle,
+                )
+            except Exception as exc:
+                logger.exception("/gonder gün işlenemedi: %s", label)
+                day_lines.append(f"• {label}: hata — {exc}")
+                continue
+
+            total_sent += sent_now
+            total_failed_dm += failed_dm
+            day_lines.append(
+                f"• {label}: tamamlanan={sent_now}, başarısız_dm={failed_dm}"
+            )
+            logger.info(
+                "/gonder gün bitti: %s sent=%s failed_dm=%s",
+                label,
+                sent_now,
+                failed_dm,
+            )
+
+        summary = (
+            f"✅ Yeniden iletim bitti\n"
+            f"Günler: {date_labels}\n"
+            f"Temizlenen dedup: {cleared_dedup}\n"
+            f"Temizlenen iletilen kayıt: {cleared_delivered}\n"
+            f"Toplam tamamlanan bildirim: {total_sent}\n"
+            f"Başarısız DM: {total_failed_dm}\n\n"
+            + "\n".join(day_lines)
+        )
+        await update.message.reply_text(summary)
+    finally:
+        _GONDER_RUNNING = False
+
+
 async def iletilenkacancagri_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         await update.message.reply_text("Kullanım: /iletilenkacancagri 28.06.2026")
@@ -1106,6 +1224,7 @@ def main() -> None:
     application.add_handler(CommandHandler("kuyruklar", kuyruklar_command, filters=allowed))
     application.add_handler(CommandHandler("kacancagri", kacancagri_command, filters=allowed))
     application.add_handler(CommandHandler("iletilenkacancagri", iletilenkacancagri_command, filters=allowed))
+    application.add_handler(CommandHandler("gonder", gonder_command, filters=allowed))
     application.add_handler(CommandHandler("personelekle", personelekle_command, filters=allowed))
     application.add_handler(CommandHandler("personelsil", personelsil_command, filters=allowed))
     application.add_handler(CommandHandler("personeller", personeller_command, filters=allowed))

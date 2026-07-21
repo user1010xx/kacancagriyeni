@@ -78,3 +78,30 @@ def test_purge_older_than_call_date(tmp_path: Path):
     assert len(store.get_by_call_date(d_old)) == 0
     assert len(store.get_by_call_date(d_keep_1)) == 1
     assert len(store.get_by_call_date(d_keep_2)) == 1
+
+
+def test_remove_by_call_key_dates(tmp_path: Path):
+    store = DeliveredStore(tmp_path / "delivered.json")
+    d1 = date(2026, 7, 20)
+    d2 = date(2026, 7, 21)
+    store.add(
+        call_key=f"90555|{d1.strftime('%d.%m.%Y')}|10:00:00|1000",
+        phone="1",
+        personel_adi="A",
+        call_date=d1,
+    )
+    store.add(
+        call_key=f"90556|{d2.strftime('%d.%m.%Y')}|11:00:00|1000",
+        phone="2",
+        personel_adi="B",
+        call_date=d2,
+    )
+    store.add(
+        call_key=f"90557|19.07.2026|12:00:00|1000",
+        phone="3",
+        personel_adi="C",
+        call_date=date(2026, 7, 19),
+    )
+    removed = store.remove_by_call_key_dates({d1, d2})
+    assert removed == 2
+    assert store.count() == 1

@@ -20,6 +20,7 @@ from invekto_client import (  # noqa: F401
     enrich_delivered_rows_with_callback_status,
     format_call_message,
     parse_command_dates,
+    parse_command_date_list,
     split_calls_by_time,
     filter_calls_after_time,
     filter_by_department,

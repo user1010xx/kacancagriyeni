@@ -249,6 +249,8 @@ def fetch_report(
     queue: str | None = None,
     page: int | None = None,
     page_size: int | None = None,
+    min_call_duration: int | None = None,
+    min_ring_duration: int | None = None,
     timeout: int | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     params: dict[str, Any] = {
@@ -261,6 +263,12 @@ def fetch_report(
         params["pageSize"] = page_size
     if page is not None:
         params["page"] = page
+    # Cevapsız dış aramalar (görüşme 00:00:00) personel eşlemesi için gerekli.
+    # Varsayılan API eşiği bunları elemiş olabilir.
+    if min_call_duration is not None:
+        params["minCallDuration"] = min_call_duration
+    if min_ring_duration is not None:
+        params["minRingDuration"] = min_ring_duration
 
     body = _request_json(
         "GET",
@@ -428,6 +436,11 @@ def normalize_queue_detail_row(record: dict[str, Any]) -> dict[str, Any]:
         "extension",
         "Dahili",
         "dahili",
+        "DahiliNumarasi",
+        "Dahili Numarası",
+        "DAHİLİ NUMARASI",
+        "extensionNumber",
+        "ExtensionNumber",
         "CompletedExtension",
     )
     extension_name = _field(
@@ -437,6 +450,8 @@ def normalize_queue_detail_row(record: dict[str, Any]) -> dict[str, Any]:
         "DahiliAdi",
         "dahiliAdi",
         "dahili_adi",
+        "Dahili Adı",
+        "DAHİLİ ADI",
         "Agent",
         "agent",
         "CompletedExtensionName",
@@ -490,15 +505,74 @@ def normalize_queue_detail_row(record: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def _field_slug_contains(record: dict[str, Any], *needles: str) -> str:
+    """Alan adında (slug) needle geçen ilk dolu değeri döndürür."""
+    needle_set = {_key_slug(n) for n in needles if n}
+    for key, value in record.items():
+        if value in (None, ""):
+            continue
+        slug = _key_slug(str(key))
+        if any(n and n in slug for n in needle_set):
+            text = str(value).strip()
+            # Süre / boş tire alanlarını telefon sanma
+            if not text or text in {"-", "—", "–"}:
+                continue
+            if re.fullmatch(r"\d{1,2}:\d{2}(:\d{2})?", text):
+                continue
+            return text
+    return ""
+
+
+def _looks_like_external_phone(value: str) -> bool:
+    digits = re.sub(r"\D", "", str(value or ""))
+    # TR harici/mobil genelde 10+ hane (90 + 10 veya 0 + 10)
+    return len(digits) >= 10
+
+
+def _looks_like_extension(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text or text in {"-", "—", "–"}:
+        return False
+    digits = re.sub(r"\D", "", text)
+    # Dahili: kısa numara (2-6 hane) veya isim (seda, selcuk)
+    if 2 <= len(digits) <= 6 and digits == re.sub(r"\D", "", text):
+        return True
+    if not digits and 2 <= len(text) <= 40:
+        return True
+    # "seda", "selcuk -O"
+    if re.search(r"[A-Za-zÇĞİÖŞÜçğıöşü]", text) and len(text) <= 40:
+        return True
+    return False
+
+
+def _best_external_phone(*candidates: Any) -> str:
+    best = ""
+    best_digits = ""
+    for raw in candidates:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        digits = re.sub(r"\D", "", text)
+        if len(digits) < 10:
+            continue
+        # Daha uzun / 90'lı formatı tercih et
+        if len(digits) > len(best_digits) or (
+            len(digits) == len(best_digits) and digits.startswith("90")
+        ):
+            best = text
+            best_digits = digits
+    return best
+
+
 def normalize_conversation_row(record: dict[str, Any]) -> dict[str, Any]:
     """Görüşme/CDR satırını botun beklediği forma çevirir.
 
     queue-detail ile aynı Türkçe UI alanlarını da destekler
     (TELEFON, DAHİLİ ADI, DAHİLİ NUMARASI, TARİH, SAAT, …).
-    Aksi halde telefon→dahili cache boş kalır ve tüm kaçan çağrılar
-    'personel bulunamadı' diye düşer.
+    Ayrıca bilinmeyen alan adlarında slug taraması yapar — aksi halde
+    telefon→dahili cache boş kalır ve tüm kaçanlar 'personel yok' düşer.
     """
-    phone = _field(
+    phone_known = _field(
         record,
         "Phone",
         "phone",
@@ -510,10 +584,28 @@ def normalize_conversation_row(record: dict[str, Any]) -> dict[str, Any]:
         "calledNumber",
         "Destination",
         "destination",
+        "Callee",
+        "callee",
+        "RemoteNumber",
+        "remoteNumber",
+        "number",
+        "Number",
         "Telefon",
         "telefon",
         "TELEFON",
     )
+    phone_slug = _field_slug_contains(
+        record,
+        "telefon",
+        "phone",
+        "caller",
+        "called",
+        "destination",
+        "remote",
+        "number",
+    )
+    phone = _best_external_phone(phone_known, phone_slug) or phone_known or phone_slug
+
     call_date_raw = _field(
         record,
         "Date",
@@ -521,10 +613,20 @@ def normalize_conversation_row(record: dict[str, Any]) -> dict[str, Any]:
         "ChekInDate",
         "CreateDate",
         "callDate",
+        "startDate",
+        "StartDate",
+        "start_time",
+        "startTime",
+        "StartTime",
+        "datetime",
+        "DateTime",
         "Tarih",
         "tarih",
         "TARİH",
     )
+    if not call_date_raw:
+        call_date_raw = _field_slug_contains(record, "tarih", "date", "start")
+
     call_time_raw = _field(
         record,
         "Time",
@@ -532,15 +634,20 @@ def normalize_conversation_row(record: dict[str, Any]) -> dict[str, Any]:
         "ChekInTime",
         "CreateTime",
         "callTime",
+        "startTime",
+        "StartTime",
         "Saat",
         "saat",
         "SAAT",
     )
+    if not call_time_raw:
+        call_time_raw = _field_slug_contains(record, "saat", "time")
+
     # Tek datetime alanında birleşik gelebilir
-    if not call_time_raw and call_date_raw and "T" in str(call_date_raw):
+    if not call_time_raw and call_date_raw and ("T" in str(call_date_raw) or " " in str(call_date_raw)):
         call_time_raw = call_date_raw
 
-    # Dahili numarası (608) — UI: DAHİLİ NUMARASI
+    # Dahili numarası (622) — UI: DAHİLİ NUMARASI
     extension = _field(
         record,
         "Extension",
@@ -553,8 +660,24 @@ def normalize_conversation_row(record: dict[str, Any]) -> dict[str, Any]:
         "DAHİLİ NUMARASI",
         "extensionNumber",
         "ExtensionNumber",
+        "agentExtension",
+        "AgentExtension",
+        "src",
+        "Src",
     )
-    # Dahili adı (selcuk) — UI: DAHİLİ ADI
+    if not extension or _looks_like_external_phone(extension):
+        ext_slug = _field_slug_contains(
+            record,
+            "dahilinumara",
+            "extensionnumber",
+            "extension",
+            "dahili",
+            "agentext",
+        )
+        if ext_slug and _looks_like_extension(ext_slug) and not _looks_like_external_phone(ext_slug):
+            extension = ext_slug
+
+    # Dahili adı (seda) — UI: DAHİLİ ADI
     extension_name = _field(
         record,
         "ExtensionName",
@@ -562,6 +685,8 @@ def normalize_conversation_row(record: dict[str, Any]) -> dict[str, Any]:
         "CompletedExtensionName",
         "Agent",
         "agent",
+        "agentName",
+        "AgentName",
         "Name",
         "DahiliAdi",
         "dahiliAdi",
@@ -569,8 +694,27 @@ def normalize_conversation_row(record: dict[str, Any]) -> dict[str, Any]:
         "Dahili Adı",
         "DAHİLİ ADI",
         "User",
+        "userName",
         "DisplayName",
     )
+    if not extension_name:
+        extension_name = _field_slug_contains(
+            record,
+            "dahiliadi",
+            "extensionname",
+            "agentname",
+            "agent",
+            "displayname",
+            "username",
+        )
+
+    # Dahili numara yanlışlıkla isim alanına yazıldıysa ayır
+    if extension and not re.search(r"\d", extension) and not extension_name:
+        extension_name = extension
+        extension = ""
+    if extension_name and re.fullmatch(r"\d{2,6}", extension_name) and not extension:
+        extension = extension_name
+        extension_name = ""
 
     call_date = _normalize_call_date(call_date_raw)
     call_time = _normalize_time(call_time_raw)
@@ -835,15 +979,20 @@ def fetch_conversations(
     end_date: date,
     *,
     timeout: int = 30,
+    include_zero_duration: bool = True,
 ) -> list[dict[str, Any]]:
     del company_code
     all_rows: list[dict[str, Any]] = []
+    min_call = 0 if include_zero_duration else None
+    min_ring = 0 if include_zero_duration else None
 
     # 1) OpenAPI önerisi: pageSize olmadan tüm pencere (max 5000)
     rows, meta = fetch_report(
         "conversations",
         start_date,
         end_date,
+        min_call_duration=min_call,
+        min_ring_duration=min_ring,
         timeout=timeout,
     )
     all_rows.extend(rows)
@@ -862,6 +1011,8 @@ def fetch_conversations(
                 end_date,
                 page=1,
                 page_size=page_size,
+                min_call_duration=min_call,
+                min_ring_duration=min_ring,
                 timeout=timeout,
             )
             all_rows = list(rows_p1)
@@ -874,6 +1025,8 @@ def fetch_conversations(
                 end_date,
                 page=page,
                 page_size=page_size,
+                min_call_duration=min_call,
+                min_ring_duration=min_ring,
                 timeout=timeout,
             )
             if not rows_page:
@@ -964,37 +1117,126 @@ def get_available_queues(
     return sorted((name, number) for name, number in queues.items())
 
 
+def _ingest_phone_dahili_hit(
+    phone_best: dict[str, tuple[datetime, str]],
+    rec: dict[str, Any],
+) -> None:
+    """Normalize edilmiş kayıttan cache'e telefon→dahili işler."""
+    phone_key = _normalize_phone(rec.get("Phone") or rec.get("phone") or "")
+    # TR harici numara: normalize sonrası en az 10 hane
+    if not phone_key or len(re.sub(r"\D", "", phone_key)) < 10:
+        return
+
+    dahili = _extract_dahili_from_record(rec)
+    if not dahili:
+        return
+    # Harici numara dahili sanılmasın
+    if _looks_like_external_phone(dahili):
+        return
+
+    when = _parse_conversation_datetime(
+        rec.get("Date") or rec.get("ChekInDate") or rec.get("CreateDate") or "",
+        rec.get("Time") or rec.get("ChekInTime") or rec.get("CreateTime") or "",
+    )
+    def _rank(value: str) -> int:
+        # Aynı anda hem isim hem numara gelirse numarayı tercih et (personel anahtarı).
+        text = str(value or "").strip()
+        if re.fullmatch(r"\d{2,6}", text):
+            return 2
+        return 1
+
+    prev = phone_best.get(phone_key)
+    if (
+        prev is None
+        or when > prev[0]
+        or (when == prev[0] and _rank(dahili) > _rank(prev[1]))
+    ):
+        phone_best[phone_key] = (when, dahili)
+
+
 def build_phone_dahili_cache(
     company_code: str,
     days: int = 15,
     timeout: int = 30,
 ) -> dict[str, str]:
-    """Son N günlük görüşmelerden telefon → son dahili eşlemesi."""
+    """Son N günden telefon → son dahili eşlemesi.
+
+    Neden sadece conversations yetmez:
+    - UI'daki CDR (Dış Arama, görüşme 00:00:00) conversations'ta yok sayılabilir
+      veya 15 günlük tek pencerede 5000 satır cap yüzünden düşer.
+    - Bu yüzden GÜN GÜN conversations + queue-detail birleştirilir;
+      minCallDuration=0 ile cevapsız dış aramalar da alınır.
+    """
+    del company_code  # imza uyumu; Toniva API key ile çalışır
     end_date = _report_today()
-    start_date = end_date - timedelta(days=days)
-    try:
-        records = fetch_conversations(
-            company_code,
-            start_date,
-            end_date,
-            timeout=timeout,
-        )
-    except Exception as exc:
-        logger.warning("Toniva dahili cache oluşturulamadı: %s", exc)
-        return {}
-
+    days = max(1, int(days))
     phone_best: dict[str, tuple[datetime, str]] = {}
-    for rec in records:
-        phone_key = _normalize_phone(rec.get("Phone") or rec.get("phone") or "")
-        dahili = _extract_dahili_from_record(rec)
-        if not phone_key or not dahili:
-            continue
-        when = _parse_conversation_datetime(
-            rec.get("Date") or rec.get("ChekInDate") or rec.get("CreateDate") or "",
-            rec.get("Time") or rec.get("ChekInTime") or rec.get("CreateTime") or "",
-        )
-        prev = phone_best.get(phone_key)
-        if prev is None or when > prev[0]:
-            phone_best[phone_key] = (when, dahili)
+    conv_count = 0
+    qd_count = 0
+    sample_raw_keys: list[str] = []
 
-    return {phone: dahili for phone, (_, dahili) in phone_best.items()}
+    for offset in range(days + 1):
+        day = end_date - timedelta(days=offset)
+
+        # 1) Conversations (sıfır süreli aramalar dahil)
+        try:
+            conv_rows = fetch_conversations(
+                "toniva",
+                day,
+                day,
+                timeout=timeout,
+                include_zero_duration=True,
+            )
+            conv_count += len(conv_rows)
+            for rec in conv_rows:
+                _ingest_phone_dahili_hit(phone_best, rec)
+        except Exception as exc:
+            logger.warning(
+                "Toniva conversations cache günü başarısız (%s): %s",
+                day.isoformat(),
+                exc,
+            )
+
+        # 2) queue-detail — cevaplanan/kaçan kuyruk satırlarında dahili olabilir
+        try:
+            raw_qd, _ = fetch_report(
+                "queue-detail",
+                day,
+                day,
+                min_call_duration=0,
+                min_ring_duration=0,
+                timeout=timeout,
+            )
+            if raw_qd and not sample_raw_keys and isinstance(raw_qd[0], dict):
+                sample_raw_keys = list(raw_qd[0].keys())[:25]
+            for raw in raw_qd:
+                # Hem queue-detail normalize hem conversation-style (TR CDR)
+                for norm in (
+                    normalize_queue_detail_row(raw),
+                    normalize_conversation_row(raw),
+                ):
+                    _ingest_phone_dahili_hit(phone_best, norm)
+                    qd_count += 1
+        except Exception as exc:
+            logger.warning(
+                "Toniva queue-detail cache günü başarısız (%s): %s",
+                day.isoformat(),
+                exc,
+            )
+
+    cache = {phone: dahili for phone, (_, dahili) in phone_best.items()}
+    logger.info(
+        "Toniva dahili cache: %s numara | conv_rows=%s qd_norm_hits=%s days=%s…%s",
+        len(cache),
+        conv_count,
+        qd_count,
+        end_date - timedelta(days=days),
+        end_date,
+    )
+    if not cache:
+        logger.warning(
+            "Toniva dahili cache BOŞ — personel eşlemesi yapılamaz. "
+            "Örnek ham alan adları: %s",
+            sample_raw_keys or "(yok)",
+        )
+    return cache

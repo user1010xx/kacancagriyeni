@@ -450,6 +450,36 @@ def parse_command_dates(text: str) -> tuple[date, date]:
     return start, end
 
 
+def parse_command_date_list(text: str) -> list[date]:
+    """Virgül veya boşlukla ayrılmış bir veya daha fazla gün listesi.
+
+    Örnek: '20.07.2026,21.07.2026' veya '20.07.2026 21.07.2026'
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        raise ValueError(
+            "En az bir tarih gerekli. Örnek: /gonder 20.07.2026,21.07.2026"
+        )
+
+    parts = [p for p in re.split(r"[\s,;]+", raw) if p.strip()]
+    if not parts:
+        raise ValueError(
+            "En az bir tarih gerekli. Örnek: /gonder 20.07.2026,21.07.2026"
+        )
+
+    dates: list[date] = []
+    seen: set[date] = set()
+    for part in parts:
+        try:
+            d = _parse_date(part.strip())
+        except ValueError as exc:
+            raise ValueError(f"Geçersiz tarih: {part.strip()}") from exc
+        if d not in seen:
+            seen.add(d)
+            dates.append(d)
+    return dates
+
+
 # ====================== YENİ: GÖRÜŞME + PERSONEL YÖNLENDİRME ======================
 
 def _normalize_phone(phone: str) -> str:

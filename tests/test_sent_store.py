@@ -67,3 +67,25 @@ def test_purge_old(tmp_path: Path):
     assert removed == 1
     assert store.is_complete(new_key)
     assert not store.is_complete(old_key)
+
+
+def test_unmark_for_dates(tmp_path: Path):
+    store = SentStore(tmp_path / "sent_calls.json")
+    d1 = date(2026, 7, 20)
+    d2 = date(2026, 7, 21)
+    d3 = date(2026, 7, 19)
+    k1 = f"905551112233|{d1.strftime('%d.%m.%Y')}|10:00:00|1000"
+    k2 = f"905551112244|{d2.strftime('%d.%m.%Y')}|11:00:00|1000"
+    k3 = f"905551112255|{d3.strftime('%d.%m.%Y')}|12:00:00|1000"
+
+    store.mark_complete(k1)
+    store.mark_group_notified(k2)
+    store.mark_private_notified(k2)
+    store.mark_complete(k3)
+
+    removed = store.unmark_for_dates({d1, d2})
+    assert removed == 3
+    assert not store.is_complete(k1)
+    assert not store.is_group_notified(k2)
+    assert not store.is_private_notified(k2)
+    assert store.is_complete(k3)

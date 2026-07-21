@@ -105,6 +105,7 @@ Bot aynı kaynağı kullanır:
 | `/kuyruklar` | PBX kuyruk listesi |
 | `/kacancagri 15.06.2026, 25.06.2026` | Excel kaçan çağrı raporu |
 | `/iletilenkacancagri 28.06.2026` | İletilen çağrı + geri arama raporu |
+| `/gonder 20.07.2026,21.07.2026` | Seçili günleri gruba+DM yeniden ilet (dedup temizler) |
 | `/personelekle` `/personelsil` `/personeller` | Personel yönetimi |
 | `/temizle` | Eski dedup kayıtlarını temizle |
 | Excel (.xlsx) yükle | Toplu personel: A=isim, B=dahili, C=@username |

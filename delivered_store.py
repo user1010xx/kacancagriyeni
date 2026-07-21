@@ -122,3 +122,31 @@ class DeliveredStore:
 
     def count(self) -> int:
         return len(self._entries)
+
+    def remove_by_call_key_dates(self, target_dates: set[date] | list[date]) -> int:
+        """call_key içindeki çağrı tarihine göre iletilen kayıtları siler (yeniden iletim)."""
+        wanted = {d for d in target_dates if isinstance(d, date)}
+        if not wanted:
+            return 0
+
+        def _key_date(call_key: str) -> date | None:
+            for part in str(call_key or "").split("|"):
+                try:
+                    return datetime.strptime(part.strip(), "%d.%m.%Y").date()
+                except Exception:
+                    continue
+            return None
+
+        with self._lock:
+            before = len(self._entries)
+            kept: list[dict[str, str]] = []
+            for entry in self._entries:
+                kd = _key_date(str(entry.get("call_key") or ""))
+                if kd is not None and kd in wanted:
+                    continue
+                kept.append(entry)
+            self._entries = kept
+            removed = before - len(self._entries)
+            if removed:
+                self._save()
+            return removed

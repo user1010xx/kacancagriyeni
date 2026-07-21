@@ -204,7 +204,6 @@ def test_normalize_conversation_row_turkish_cdr_headers():
 
 
 def test_build_phone_dahili_cache_from_turkish_conversation_rows():
-    from datetime import date as date_cls
     from invekto_client import _normalize_phone
     from toniva_client import build_phone_dahili_cache
 
@@ -229,9 +228,78 @@ def test_build_phone_dahili_cache_from_turkish_conversation_rows():
         "toniva_client.fetch_report",
         return_value=(api_rows, {}),
     ):
-        cache = build_phone_dahili_cache("toniva", days=15)
+        cache = build_phone_dahili_cache("toniva", days=2)
 
     phone_key = _normalize_phone("905319598246")
     assert phone_key in cache
     assert cache[phone_key] == "608"
     assert cache[_normalize_phone("905551112233")] == "105"
+
+
+def test_normalize_outbound_zero_talk_cdr_seda():
+    """Kullanıcı vakası: Dış Arama + 00:00:00 görüşme + seda/622."""
+    row = normalize_conversation_row(
+        {
+            "YÖN": "Dış Arama",
+            "DAHİLİ ADI": "seda",
+            "DAHİLİ NUMARASI": "622",
+            "TELEFON": "905412084627",
+            "TARİH": "Salı 21 Temmuz 2026",
+            "SAAT": "16:43:54",
+            "ÇALDIRMA SÜRESİ": "00:00:21",
+            "GÖRÜŞME SÜRESİ": "00:00:00",
+        }
+    )
+    assert row["Phone"] == "905412084627"
+    assert row["Extension"] == "622"
+    assert row["ExtensionName"] == "seda"
+
+
+def test_build_phone_dahili_cache_merges_queue_detail_and_conversations():
+    """conversations boş olsa bile queue-detail/CDR satırından eşleme kurulmalı."""
+    from invekto_client import _normalize_phone
+    from toniva_client import build_phone_dahili_cache
+
+    def fake_fetch(slug, start_date, end_date, **kwargs):
+        if slug == "conversations":
+            return [], {}
+        if slug == "queue-detail":
+            return (
+                [
+                    {
+                        "YÖN": "Dış Arama",
+                        "DAHİLİ ADI": "seda",
+                        "DAHİLİ NUMARASI": "622",
+                        "TELEFON": "905412084627",
+                        "TARİH": "Salı 21 Temmuz 2026",
+                        "SAAT": "16:43:54",
+                        "GÖRÜŞME SÜRESİ": "00:00:00",
+                    }
+                ],
+                {},
+            )
+        return [], {}
+
+    with patch("toniva_client.fetch_report", side_effect=fake_fetch):
+        cache = build_phone_dahili_cache("toniva", days=1)
+
+    assert cache.get(_normalize_phone("905412084627")) == "622"
+
+
+def test_build_phone_dahili_cache_passes_zero_duration_params():
+    """Cevapsız dış aramalar için minCallDuration=0 gitmeli."""
+    from toniva_client import build_phone_dahili_cache
+
+    calls: list[dict] = []
+
+    def fake_fetch(slug, start_date, end_date, **kwargs):
+        calls.append({"slug": slug, **kwargs})
+        return ([], {})
+
+    with patch("toniva_client.fetch_report", side_effect=fake_fetch):
+        build_phone_dahili_cache("toniva", days=0)
+
+    conv_calls = [c for c in calls if c["slug"] == "conversations"]
+    assert conv_calls
+    assert conv_calls[0].get("min_call_duration") == 0
+    assert conv_calls[0].get("min_ring_duration") == 0

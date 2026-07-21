@@ -202,3 +202,35 @@ class SentStore:
             self._save()
             after = len(self._completed) + len(self._group_notified) + len(self._private_notified)
             return before - after
+
+    def unmark_for_dates(self, target_dates: set[date] | list[date]) -> int:
+        """Belirtilen çağrı günlerine ait dedup kayıtlarını siler (yeniden iletim için)."""
+        wanted = {d for d in target_dates if isinstance(d, date)}
+        if not wanted:
+            return 0
+
+        def _matches(key: str) -> bool:
+            kd = self._extract_date_from_key(key)
+            return kd is not None and kd in wanted
+
+        with self._lock:
+            before = (
+                len(self._completed)
+                + len(self._group_notified)
+                + len(self._private_notified)
+            )
+            self._completed = {k for k in self._completed if not _matches(k)}
+            self._group_notified = {k for k in self._group_notified if not _matches(k)}
+            self._private_notified = {
+                k for k in self._private_notified if not _matches(k)
+            }
+            after = (
+                len(self._completed)
+                + len(self._group_notified)
+                + len(self._private_notified)
+            )
+            removed = before - after
+            if removed:
+                self._dirty = True
+                self._save()
+            return removed

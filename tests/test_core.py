@@ -8,6 +8,7 @@ from invekto_client import (
     fetch_conversations,
     enrich_delivered_rows_with_callback_status,
     parse_command_dates,
+    parse_command_date_list,
     call_key,
     format_call_message,
     filter_by_department,
@@ -20,6 +21,15 @@ from invekto_client import (
     _normalize_phone,
     _parse_conversation_datetime,
 )
+
+
+def test_parse_command_date_list():
+    dates = parse_command_date_list("20.07.2026,21.07.2026")
+    assert dates == [date(2026, 7, 20), date(2026, 7, 21)]
+    dates2 = parse_command_date_list("20.07.2026 21.07.2026")
+    assert dates2 == [date(2026, 7, 20), date(2026, 7, 21)]
+    # tekil + tekrar
+    assert parse_command_date_list("20.07.2026,20.07.2026") == [date(2026, 7, 20)]
 
 
 def test_parse_command_dates_valid():
