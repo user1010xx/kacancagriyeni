@@ -143,34 +143,129 @@ def _field(record: dict[str, Any], *keys: str, default: str = "") -> str:
     return default
 
 
+def _rows_from_columns_matrix(
+    columns: Any,
+    matrix: Any,
+) -> list[dict[str, Any]]:
+    """columns + list-of-lists → dict satırlar (CDR tablo formatı)."""
+    if not isinstance(columns, list) or not columns:
+        return []
+    if not isinstance(matrix, list) or not matrix:
+        return []
+    col_names = [str(c).strip() for c in columns]
+    out: list[dict[str, Any]] = []
+    for row in matrix:
+        if not isinstance(row, (list, tuple)):
+            continue
+        item: dict[str, Any] = {}
+        for idx, name in enumerate(col_names):
+            if not name:
+                continue
+            item[name] = row[idx] if idx < len(row) else None
+        if item:
+            out.append(item)
+    return out
+
+
 def _extract_rows(body: Any) -> list[dict[str, Any]]:
-    """Toniva yanıtından satır listesini çıkarır (rows / data / Data / list)."""
+    """Toniva yanıtından satır listesini çıkarır.
+
+    Desteklenen şekiller:
+    - [ {...}, {...} ]
+    - { rows|data|items|records|result: [ {...} ] }
+    - { columns: [...], rows|data: [ [...], ... ] }  ← tablo/CDR
+    - iç içe payload / result sarmalayıcıları
+    """
     if isinstance(body, list):
-        return [r for r in body if isinstance(r, dict)]
+        if not body:
+            return []
+        if isinstance(body[0], dict):
+            return [r for r in body if isinstance(r, dict)]
+        return []
 
     if not isinstance(body, dict):
         raise TonivaError("Toniva API beklenmeyen yanıt tipi döndürdü.")
 
-    # Öncelik: bilinen anahtarlar (yanlış liste seçimini azaltır)
-    for key in ("rows", "data", "Data", "items", "result", "records"):
+    # Tablo formatı: columns + matrix
+    for col_key in ("columns", "Columns", "fields", "Fields", "headers", "Headers"):
+        cols = body.get(col_key)
+        if not cols:
+            continue
+        for row_key in ("rows", "data", "Data", "items", "records", "values", "result"):
+            matrix = body.get(row_key)
+            table = _rows_from_columns_matrix(cols, matrix)
+            if table:
+                logger.info(
+                    "Toniva satırlar tablo formatından okundu (columns=%s, rows=%s)",
+                    len(cols) if isinstance(cols, list) else "?",
+                    len(table),
+                )
+                return table
+
+    # Bilinen anahtarlar (dict satırlar)
+    for key in (
+        "rows",
+        "data",
+        "Data",
+        "items",
+        "result",
+        "records",
+        "calls",
+        "list",
+        "payload",
+        "content",
+    ):
         value = body.get(key)
         if isinstance(value, list):
-            return [r for r in value if isinstance(r, dict)]
+            if value and isinstance(value[0], dict):
+                return [r for r in value if isinstance(r, dict)]
+            # list of lists without columns at this level — skip
         if isinstance(value, dict):
-            for inner in ("rows", "data", "items", "records"):
-                nested = value.get(inner)
-                if isinstance(nested, list):
-                    return [r for r in nested if isinstance(r, dict)]
+            nested = _extract_rows(value)
+            if nested:
+                return nested
 
-    # Son çare: meta dışındaki ilk dict-listesi
-    skip_keys = {"meta", "Meta", "error", "errors", "message", "Message"}
-    for key, value in body.items():
-        if key in skip_keys:
-            continue
-        if isinstance(value, list) and value and isinstance(value[0], dict):
-            logger.debug("Toniva satırlar '%s' alanından okundu (fallback).", key)
-            return [r for r in value if isinstance(r, dict)]
+    # Son çare: meta dışındaki en büyük dict-listesi (derinlik 3)
+    skip_keys = {
+        "meta",
+        "Meta",
+        "error",
+        "errors",
+        "message",
+        "Message",
+        "code",
+        "status",
+        "Status",
+        "columns",
+        "Columns",
+    }
 
+    def _find_dict_lists(obj: Any, depth: int = 0) -> list[list[dict[str, Any]]]:
+        if depth > 3:
+            return []
+        found: list[list[dict[str, Any]]] = []
+        if isinstance(obj, list) and obj and isinstance(obj[0], dict):
+            found.append([r for r in obj if isinstance(r, dict)])
+            return found
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k in skip_keys:
+                    continue
+                found.extend(_find_dict_lists(v, depth + 1))
+        return found
+
+    candidates = _find_dict_lists(body)
+    if candidates:
+        best = max(candidates, key=len)
+        logger.debug("Toniva satırlar recursive fallback ile okundu (%s satır).", len(best))
+        return best
+
+    # Boş yanıtta anahtarları logla — üretim debug
+    if body:
+        logger.warning(
+            "Toniva yanıtında satır listesi bulunamadı. top_keys=%s",
+            list(body.keys())[:20],
+        )
     return []
 
 
@@ -1117,9 +1212,19 @@ def get_available_queues(
     return sorted((name, number) for name, number in queues.items())
 
 
+def _dahili_rank(value: str) -> int:
+    """Aynı anda hem isim hem numara gelirse numarayı tercih et."""
+    text = str(value or "").strip()
+    if re.fullmatch(r"\d{2,6}", text):
+        return 2
+    return 1
+
+
 def _ingest_phone_dahili_hit(
     phone_best: dict[str, tuple[datetime, str]],
     rec: dict[str, Any],
+    *,
+    when: datetime | None = None,
 ) -> None:
     """Normalize edilmiş kayıttan cache'e telefon→dahili işler."""
     phone_key = _normalize_phone(rec.get("Phone") or rec.get("phone") or "")
@@ -1134,24 +1239,203 @@ def _ingest_phone_dahili_hit(
     if _looks_like_external_phone(dahili):
         return
 
-    when = _parse_conversation_datetime(
-        rec.get("Date") or rec.get("ChekInDate") or rec.get("CreateDate") or "",
-        rec.get("Time") or rec.get("ChekInTime") or rec.get("CreateTime") or "",
-    )
-    def _rank(value: str) -> int:
-        # Aynı anda hem isim hem numara gelirse numarayı tercih et (personel anahtarı).
-        text = str(value or "").strip()
-        if re.fullmatch(r"\d{2,6}", text):
-            return 2
-        return 1
+    if when is None:
+        when = _parse_conversation_datetime(
+            rec.get("Date") or rec.get("ChekInDate") or rec.get("CreateDate") or "",
+            rec.get("Time") or rec.get("ChekInTime") or rec.get("CreateTime") or "",
+        )
 
     prev = phone_best.get(phone_key)
     if (
         prev is None
         or when > prev[0]
-        or (when == prev[0] and _rank(dahili) > _rank(prev[1]))
+        or (when == prev[0] and _dahili_rank(dahili) > _dahili_rank(prev[1]))
     ):
         phone_best[phone_key] = (when, dahili)
+
+
+def _guess_when_from_raw(raw: dict[str, Any]) -> datetime:
+    """Ham satırdan en iyi tarih-saat tahminini çıkarır."""
+    date_cands: list[str] = []
+    time_cands: list[str] = []
+    for key, value in raw.items():
+        if value in (None, ""):
+            continue
+        text = str(value).strip()
+        slug = _key_slug(str(key))
+        if any(n in slug for n in ("tarih", "date", "start", "datetime", "created")):
+            date_cands.append(text)
+        if any(n in slug for n in ("saat", "time")) and "date" not in slug:
+            time_cands.append(text)
+        # ISO tek alan
+        if "T" in text and re.match(r"\d{4}-\d{2}-\d{2}T", text):
+            date_cands.append(text)
+            time_cands.append(text)
+
+    for d in date_cands or [""]:
+        d_norm = _normalize_call_date(d) or d
+        t_norm = ""
+        for t in time_cands or [""]:
+            t_norm = _normalize_time(t) or t
+            when = _parse_conversation_datetime(d_norm, t_norm)
+            if when != datetime.min:
+                return when
+        when = _parse_conversation_datetime(d_norm, t_norm or "")
+        if when != datetime.min:
+            return when
+    return datetime.min
+
+
+def _ingest_raw_record_for_cache(
+    phone_best: dict[str, tuple[datetime, str]],
+    raw: dict[str, Any],
+) -> None:
+    """Şema-bağımsız ham satır işleme.
+
+    1) Bilinen normalizer'lar (queue-detail + conversation)
+    2) Tüm alanları tarayıp harici telefon + dahili (no/ad) heuristic eşlemesi
+
+    UI CDR'daki 'Dış Arama / seda / 622 / 9053…' satırları API'de farklı
+    alan adlarıyla gelse bile yakalanır.
+    """
+    if not isinstance(raw, dict) or not raw:
+        return
+
+    # 1) Standart normalizer'lar
+    for norm in (
+        normalize_conversation_row(raw),
+        normalize_queue_detail_row(raw),
+    ):
+        _ingest_phone_dahili_hit(phone_best, norm)
+
+    # 2) Heuristic: alan adından bağımsız telefon / dahili topla
+    phones: list[str] = []
+    ext_nums: list[str] = []
+    ext_names: list[str] = []
+
+    for key, value in raw.items():
+        if value in (None, ""):
+            continue
+        if isinstance(value, (dict, list, tuple, bool)):
+            continue
+        text = str(value).strip()
+        if not text or text in {"-", "—", "–"}:
+            continue
+        if re.fullmatch(r"\d{1,2}:\d{2}(:\d{2})?", text):
+            continue
+
+        slug = _key_slug(str(key))
+        digits = re.sub(r"\D", "", text)
+
+        if len(digits) >= 10:
+            # Yön/trunk/hat gibi alanlardaki santral numarasını ele
+            if any(n in slug for n in ("trunk", "hat", "line", "did")):
+                continue
+            phones.append(text)
+            continue
+
+        # Kısa numara = dahili adayı (yalnızca alan adı ipucu ile; Queue/ID yanlış pozitif olmasın)
+        if re.fullmatch(r"\d{2,6}", text):
+            if any(
+                n in slug
+                for n in (
+                    "ext",
+                    "dahili",
+                    "agent",
+                    "user",
+                    "src",
+                )
+            ) or slug in {"number", "numara", "no"}:
+                ext_nums.append(text)
+            continue
+
+        # İsim adayı
+        if re.search(r"[A-Za-zÇĞİÖŞÜçğıöşü]", text) and len(text) <= 40:
+            if any(
+                n in slug
+                for n in (
+                    "ext",
+                    "dahili",
+                    "agent",
+                    "user",
+                    "name",
+                    "person",
+                    "display",
+                )
+            ):
+                ext_names.append(text)
+
+    if not phones:
+        return
+
+    dahili = ext_nums[0] if ext_nums else (ext_names[0] if ext_names else "")
+    if not dahili or _looks_like_external_phone(dahili):
+        return
+
+    when = _guess_when_from_raw(raw)
+    for phone in phones:
+        _ingest_phone_dahili_hit(
+            phone_best,
+            {
+                "Phone": phone,
+                "Extension": ext_nums[0] if ext_nums else "",
+                "ExtensionName": ext_names[0] if ext_names else "",
+            },
+            when=when,
+        )
+
+
+def _safe_fetch_report_rows(
+    slug: str,
+    start_date: date,
+    end_date: date,
+    *,
+    timeout: int,
+    try_zero_duration: bool = False,
+) -> list[dict[str, Any]]:
+    """Rapor satırlarını güvenli çeker.
+
+    minCallDuration=0 bazı raporlarda 400 verebiliyor; önce paramsız dene,
+    gerekirse sıfır süreli ikinci deneme yap.
+    """
+    rows: list[dict[str, Any]] = []
+    try:
+        rows, _meta = fetch_report(
+            slug,
+            start_date,
+            end_date,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Toniva %s paramsız çekilemedi (%s…%s): %s",
+            slug,
+            start_date,
+            end_date,
+            exc,
+        )
+        rows = []
+
+    if try_zero_duration:
+        try:
+            rows0, _ = fetch_report(
+                slug,
+                start_date,
+                end_date,
+                min_call_duration=0,
+                min_ring_duration=0,
+                timeout=timeout,
+            )
+            if rows0:
+                # birleştir (ham dict; id yoksa tümünü ekle)
+                rows = list(rows) + list(rows0)
+        except Exception as exc:
+            logger.info(
+                "Toniva %s minDuration=0 desteklenmiyor/hata: %s",
+                slug,
+                exc,
+            )
+    return rows
 
 
 def build_phone_dahili_cache(
@@ -1161,82 +1445,139 @@ def build_phone_dahili_cache(
 ) -> dict[str, str]:
     """Son N günden telefon → son dahili eşlemesi.
 
-    Neden sadece conversations yetmez:
-    - UI'daki CDR (Dış Arama, görüşme 00:00:00) conversations'ta yok sayılabilir
-      veya 15 günlük tek pencerede 5000 satır cap yüzünden düşer.
-    - Bu yüzden GÜN GÜN conversations + queue-detail birleştirilir;
-      minCallDuration=0 ile cevapsız dış aramalar da alınır.
+    Gerçek kök neden analizi:
+    - UI 'Detaylı Arama Logları (CDR)' ≠ her zaman /reports/conversations içeriği
+    - Cevapsız dış arama (görüşme 00:00:00) conversations'ta yok sayılabilir
+    - minCallDuration=0 queue-detail'i bozup cache'i tamamen boşaltabiliyordu
+    - Yanıt tablo (columns+rows) veya farklı alan adlarıyla gelebilir
+
+    Strateji:
+    1) conversations + queue-detail (paramsız, güvenli)
+    2) conversations için ek minDuration=0 denemesi
+    3) Truncation/boşlukta gün gün conversations
+    4) Her ham satırda şema-bağımsız heuristic + normalizer
     """
     del company_code  # imza uyumu; Toniva API key ile çalışır
     end_date = _report_today()
     days = max(1, int(days))
+    start_date = end_date - timedelta(days=days)
     phone_best: dict[str, tuple[datetime, str]] = {}
-    conv_count = 0
-    qd_count = 0
     sample_raw_keys: list[str] = []
+    raw_total = 0
 
-    for offset in range(days + 1):
-        day = end_date - timedelta(days=offset)
+    def _consume_raw(raw_rows: list[dict[str, Any]]) -> None:
+        nonlocal raw_total, sample_raw_keys
+        for raw in raw_rows:
+            if not isinstance(raw, dict):
+                continue
+            raw_total += 1
+            if not sample_raw_keys:
+                sample_raw_keys = list(raw.keys())[:30]
+            _ingest_raw_record_for_cache(phone_best, raw)
 
-        # 1) Conversations (sıfır süreli aramalar dahil)
-        try:
-            conv_rows = fetch_conversations(
-                "toniva",
-                day,
-                day,
-                timeout=timeout,
-                include_zero_duration=True,
-            )
-            conv_count += len(conv_rows)
-            for rec in conv_rows:
-                _ingest_phone_dahili_hit(phone_best, rec)
-        except Exception as exc:
-            logger.warning(
-                "Toniva conversations cache günü başarısız (%s): %s",
-                day.isoformat(),
-                exc,
-            )
+    # --- 1) conversations tam pencere ---
+    conv_n = 0
+    conv0_n = 0
+    try:
+        conv = fetch_conversations(
+            "toniva",
+            start_date,
+            end_date,
+            timeout=timeout,
+            include_zero_duration=False,
+        )
+        conv_n = len(conv)
+        for rec in conv:
+            _ingest_phone_dahili_hit(phone_best, rec)
+    except Exception as exc:
+        logger.warning("Toniva conversations (paramsız) cache başarısız: %s", exc)
 
-        # 2) queue-detail — cevaplanan/kaçan kuyruk satırlarında dahili olabilir
-        try:
-            raw_qd, _ = fetch_report(
-                "queue-detail",
-                day,
-                day,
-                min_call_duration=0,
-                min_ring_duration=0,
-                timeout=timeout,
-            )
-            if raw_qd and not sample_raw_keys and isinstance(raw_qd[0], dict):
-                sample_raw_keys = list(raw_qd[0].keys())[:25]
-            for raw in raw_qd:
-                # Hem queue-detail normalize hem conversation-style (TR CDR)
-                for norm in (
-                    normalize_queue_detail_row(raw),
-                    normalize_conversation_row(raw),
-                ):
-                    _ingest_phone_dahili_hit(phone_best, norm)
-                    qd_count += 1
-        except Exception as exc:
-            logger.warning(
-                "Toniva queue-detail cache günü başarısız (%s): %s",
-                day.isoformat(),
-                exc,
-            )
+    # Sıfır süreli (CDR dış arama) için ayrı geçiş — 400 olursa base bozulmasın
+    try:
+        conv0 = fetch_conversations(
+            "toniva",
+            start_date,
+            end_date,
+            timeout=timeout,
+            include_zero_duration=True,
+        )
+        conv0_n = len(conv0)
+        for rec in conv0:
+            _ingest_phone_dahili_hit(phone_best, rec)
+    except Exception as exc:
+        logger.info("Toniva conversations minDuration=0 atlandı: %s", exc)
+
+    logger.info(
+        "Toniva cache conversations: base=%s zero_dur=%s",
+        conv_n,
+        conv0_n,
+    )
+
+    # --- 2) queue-detail (minDuration YOK — 400 riski) ---
+    try:
+        qd_rows = _safe_fetch_report_rows(
+            "queue-detail",
+            start_date,
+            end_date,
+            timeout=timeout,
+            try_zero_duration=False,
+        )
+        _consume_raw(qd_rows)
+        logger.info("Toniva cache queue-detail raw=%s", len(qd_rows))
+    except Exception as exc:
+        logger.warning("Toniva queue-detail cache başarısız: %s", exc)
+
+    # --- 3) Hâlâ zayıfsa: gün gün conversations (5000 cap kaçırma) ---
+    if len(phone_best) < 3:
+        logger.info(
+            "Toniva cache zayıf (%s numara); gün-gün conversations deneniyor.",
+            len(phone_best),
+        )
+        for offset in range(days + 1):
+            day = end_date - timedelta(days=offset)
+            try:
+                day_rows = fetch_conversations(
+                    "toniva",
+                    day,
+                    day,
+                    timeout=timeout,
+                    include_zero_duration=True,
+                )
+                for rec in day_rows:
+                    _ingest_phone_dahili_hit(phone_best, rec)
+            except Exception as exc:
+                logger.warning(
+                    "Toniva günlük conversations başarısız (%s): %s",
+                    day.isoformat(),
+                    exc,
+                )
+            try:
+                raw_day = _safe_fetch_report_rows(
+                    "queue-detail",
+                    day,
+                    day,
+                    timeout=timeout,
+                    try_zero_duration=False,
+                )
+                _consume_raw(raw_day)
+            except Exception:
+                pass
 
     cache = {phone: dahili for phone, (_, dahili) in phone_best.items()}
     logger.info(
-        "Toniva dahili cache: %s numara | conv_rows=%s qd_norm_hits=%s days=%s…%s",
+        "Toniva dahili cache: %s numara | ham_satir=%s keys_ornek=%s aralik=%s…%s",
         len(cache),
-        conv_count,
-        qd_count,
-        end_date - timedelta(days=days),
+        raw_total,
+        sample_raw_keys or "(yok)",
+        start_date,
         end_date,
     )
     if not cache:
         logger.warning(
             "Toniva dahili cache BOŞ — personel eşlemesi yapılamaz. "
-            "Örnek ham alan adları: %s",
+            "Örnek ham alan adları: %s. "
+            "UI CDR satırları API conversations/queue-detail içinde yoksa "
+            "eşleme imkânsızdır (public API'de ayrı CDR endpoint yok).",
             sample_raw_keys or "(yok)",
         )
     return cache

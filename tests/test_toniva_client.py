@@ -286,8 +286,8 @@ def test_build_phone_dahili_cache_merges_queue_detail_and_conversations():
     assert cache.get(_normalize_phone("905412084627")) == "622"
 
 
-def test_build_phone_dahili_cache_passes_zero_duration_params():
-    """Cevapsız dış aramalar için minCallDuration=0 gitmeli."""
+def test_build_phone_dahili_cache_tries_zero_duration_and_plain():
+    """Cache hem paramsız hem minDuration=0 conversations dener."""
     from toniva_client import build_phone_dahili_cache
 
     calls: list[dict] = []
@@ -297,9 +297,102 @@ def test_build_phone_dahili_cache_passes_zero_duration_params():
         return ([], {})
 
     with patch("toniva_client.fetch_report", side_effect=fake_fetch):
-        build_phone_dahili_cache("toniva", days=0)
+        build_phone_dahili_cache("toniva", days=1)
 
     conv_calls = [c for c in calls if c["slug"] == "conversations"]
-    assert conv_calls
-    assert conv_calls[0].get("min_call_duration") == 0
-    assert conv_calls[0].get("min_ring_duration") == 0
+    assert len(conv_calls) >= 2
+    # en az birinde min duration 0 olmalı (sıfır süreli CDR)
+    assert any(c.get("min_call_duration") == 0 for c in conv_calls)
+    # queue-detail minDuration ile bozulmamalı (paramsız)
+    qd = [c for c in calls if c["slug"] == "queue-detail"]
+    assert qd
+    assert all(c.get("min_call_duration") is None for c in qd)
+
+
+def test_extract_rows_columns_matrix_format():
+    """CDR tablo formatı: columns + list-of-lists."""
+    from toniva_client import _extract_rows
+
+    body = {
+        "columns": [
+            "YÖN",
+            "DAHİLİ ADI",
+            "DAHİLİ NUMARASI",
+            "TELEFON",
+            "TARİH",
+            "SAAT",
+        ],
+        "rows": [
+            [
+                "Dış Arama",
+                "seda",
+                "622",
+                "905304605429",
+                "Pazartesi 20 Temmuz 2026",
+                "18:59:26",
+            ],
+            [
+                "Dış Arama",
+                "seda",
+                "622",
+                "905304605429",
+                "Pazartesi 20 Temmuz 2026",
+                "18:53:05",
+            ],
+        ],
+    }
+    rows = _extract_rows(body)
+    assert len(rows) == 2
+    assert rows[0]["TELEFON"] == "905304605429"
+    assert rows[0]["DAHİLİ NUMARASI"] == "622"
+    assert rows[0]["DAHİLİ ADI"] == "seda"
+
+
+def test_build_cache_from_columns_matrix_cdr():
+    """Kullanıcı vakası: tablo formatı CDR → 905304605429 → 622."""
+    from invekto_client import _normalize_phone
+    from toniva_client import build_phone_dahili_cache
+
+    matrix_body_rows = [
+        {
+            "YÖN": "Dış Arama",
+            "DAHİLİ ADI": "seda",
+            "DAHİLİ NUMARASI": "622",
+            "TELEFON": "905304605429",
+            "TARİH": "Pazartesi 20 Temmuz 2026",
+            "SAAT": "18:59:26",
+            "GÖRÜŞME SÜRESİ": "00:00:00",
+        }
+    ]
+
+    def fake_fetch(slug, start_date, end_date, **kwargs):
+        if slug == "conversations":
+            # conversations boş — sadece queue-detail/ham kaynaktan gelsin
+            return [], {}
+        if slug == "queue-detail":
+            return matrix_body_rows, {}
+        return [], {}
+
+    with patch("toniva_client.fetch_report", side_effect=fake_fetch):
+        cache = build_phone_dahili_cache("toniva", days=1)
+
+    assert cache.get(_normalize_phone("905304605429")) == "622"
+
+
+def test_heuristic_ingest_unknown_field_names():
+    from toniva_client import _ingest_raw_record_for_cache
+
+    phone_best: dict = {}
+    _ingest_raw_record_for_cache(
+        phone_best,
+        {
+            "direction": "outbound",
+            "agent_name": "seda",
+            "agent_ext": "622",
+            "remote_number": "905304605429",
+            "started_at": "2026-07-20T18:59:26",
+        },
+    )
+    from invekto_client import _normalize_phone
+
+    assert phone_best.get(_normalize_phone("905304605429"))[1] == "622"
