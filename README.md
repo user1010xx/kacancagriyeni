@@ -5,7 +5,7 @@ PBX üzerinden günlük kaçan / cevapsız çağrıları tespit edip yetkili Tel
 **Desteklenen PBX sağlayıcıları:**
 
 | Provider | Env | Kaçan çağrı kaynağı |
-|----------|-----|---------------------|
+| --- | --- | --- |
 | **Toniva** (varsayılan) | `PBX_PROVIDER=toniva` | `GET /reports/queue-detail` + durum **Cevapsız** |
 | Invekto | `PBX_PROVIDER=invekto` | reportType 2 (missed-calls) |
 
@@ -21,7 +21,7 @@ PBX üzerinden günlük kaçan / cevapsız çağrıları tespit edip yetkili Tel
 
 ## Gereksinimler
 
-- Python 3.10+
+- Python 3.11 (Railway); test matrisi: 3.11 ve 3.14
 - Telegram Bot Token + Grup Chat ID
 - **Toniva:** API key (`tva_...`, scope: `reports:read`)
 - **Invekto:** 8 haneli firma kodu
@@ -40,15 +40,15 @@ PBX üzerinden günlük kaçan / cevapsız çağrıları tespit edip yetkili Tel
 2. `.env` oluştur (`.env.example` örneğini kullan)
 3. Bağımlılıkları kur:
 
-```bash
-pip install -r requirements.txt
-```
+     ```bash
+     python -m pip install -r requirements.txt
+     ```
 
 4. Botu çalıştır:
 
-```bash
-python bot.py
-```
+     ```bash
+     python bot.py
+     ```
 
 ## Ortam Değişkenleri (.env)
 
@@ -95,7 +95,7 @@ Bot aynı kaynağı kullanır:
 ## Komutlar (Sadece yetkili grupta)
 
 | Komut | Açıklama |
-|-------|----------|
+| --- | --- |
 | `/start` `/help` | Yardım |
 | `/ping` | Bağlantı ve yetki testi |
 | `/chatid` | Grup ID |
@@ -106,7 +106,7 @@ Bot aynı kaynağı kullanır:
 | `/kacancagri 15.06.2026, 25.06.2026` | Excel kaçan çağrı raporu |
 | `/iletilenkacancagri 28.06.2026` | İletilen çağrı + geri arama raporu |
 | `/gonder 20.07.2026,21.07.2026` | Seçili günleri gruba+DM yeniden ilet (arka plan) |
-| `/gonder durdur` | Çalışan `/gonder` işlemini durdur (+ task iptal) |
+| `/gonder durdur` | Devam eden gönderim kaydedildikten sonra işi durdur |
 | `/gonder sessiz` | Kalan dedup’u bildirimsiz kapat (flood acil kes) |
 | `/eslestir 9053… 585` | Telefon→dahili kalıcı eşleme (API CDR eksikse) |
 | `/debugeslesme 9053…` | Eşleme teşhisi (cache + API) |
@@ -115,6 +115,13 @@ Bot aynı kaynağı kullanır:
 | Excel (.xlsx) yükle | Toplu personel: A=isim, B=dahili, C=@username |
 
 **DM için:** Personel bota özel sohbetten `/start` yazmalıdır.
+
+Yönetim komutları (`/firmakodu`, `/temizle`, `/gonder`, `/eslestir`,
+`/debugeslesme`, personel komutları ve Excel yükleme) yalnızca tanımlı grubun
+yöneticilerine açıktır. Telegram yetki sorgusu başarısızsa işlem yapılmaz.
+Botu grup yöneticisi yapın; diğer üyelerin yetkilerinin sorgulanması için gereklidir.
+Personelin kullanıcı adı değişirse eski DM bağlantısı kaldırılır; yeni hesap `/start`
+ile bağlanmalıdır. Mevcut bağlantı başka Telegram kullanıcı ID'siyle ele geçirilemez.
 
 ## Excel Raporu
 
@@ -146,7 +153,14 @@ DATA_DIR=/app/data
 3. Env: `DATA_DIR=/app/data`
 4. Redeploy
 
-Saklananlar: `sent_calls.json`, `config.json`, `personnels.json`, `delivered_calls.json`, `logs/`
+Saklananlar: `sent_calls.json`, `config.json`, `personnels.json`, `phone_map.json`,
+`delivered_calls.json`, `gonder_state.json`, `health.json`, bunların `.bak` kopyaları ve `logs/`.
+
+Tek replica zorunludur; JSON depoları çok süreçli eşzamanlı yazım için tasarlanmamıştır.
+Atomik yazımdan sonra son geçerli içerik `.bak` dosyasına da yazılır. JSON bozulursa
+yedekten kurtarılır; bozuk dosya `.corrupt` olarak saklanır. İki kopya da okunamıyorsa
+veri sıfırlanmaz, servis açık hata verir. Şema hataları da sessizce sıfırlanmaz.
+Bu kopyalar aynı volume üzerindedir; volume kaybına karşı ayrıca harici yedek alınmalıdır.
 
 ### 3. Toniva IP whitelist
 
@@ -154,33 +168,70 @@ Tenant'ta IP kısıtı varsa Railway outbound IP'yi Toniva whitelist'e ekle (`40
 
 ### 4. Rate limit
 
-Toniva: 100 istek/dakika. Poll ~30 sn + conversation cache 5 dk ile limit altında kalınır. `429` durumunda `Retry-After` ile beklenir.
+Toniva: 100 istek/dakika. Çok günlük tarama ve raporlar bu sınıra yaklaşabilir;
+poll aralığını veri hacmine göre ayarlayın. PBX istemcisi `429` için yeniden dener.
+Telegram çağrı bildirimleri ve Excel raporları `RetryAfter` süresine uyarak en fazla
+üç kez denenir. DM başarısızsa bekleyen kayıt korunur.
 
 ## Mimari
 
-```
+```text
 bot.py → pbx_provider.py → toniva_client.py | invekto_client.py
                 ↓
      notifications / sent_store / personnel / delivered / excel
 ```
 
-- Polling (JobQueue), her poll **bugünün** verisi
+- Polling (JobQueue): bugün, dün ve kalıcı bekleyen çağrıların günleri
+- Kesinti sonrası son başarılı taramadan bugüne kadar eksik günler (en fazla 45 gün) taranır
 - Dedup: `Phone|dd.mm.yyyy|HH:MM:SS|Queue`
-- DM başarısızsa kayıt tamamlanmaz; sonraki poll yeniden dener
-- İlk kurulumda (`sent_calls` boş) bugünkü kayıtlar **seed** edilir (flood yok); `SEED_TODAY_ON_STARTUP`
+- DM veya grup gönderimi başarısızsa sadece eksik gönderim yeniden denenir
+- Dahili/personel eşleşmeyen çağrılar kalıcı olarak bekler; düzeltme sonrası yeniden işlenir
+- İlk kurulumda depo boşsa bugün ve dün **seed** edilir; eski çağrılar bildirimsiz kapatılır (`SEED_TODAY_ON_STARTUP`)
 - Kuyruk eşlemesi: `1000` ↔ `1000 (1000)` alias uyumu
 - Takvim: `BOT_TIMEZONE` (varsayılan `Europe/Istanbul`)
+
+### Rapor ve yeniden gönderim
+
+- İletim raporuna yalnızca başarılı personel DM'leri yazılır; grup mesajı tek başına teslim değildir.
+- `/gonder` eski geçmişi silmez; başarılı tekrar DM'leri yeni teslim satırı olarak saklanır.
+- `/gonder durdur` eski kayıtları değiştirmez. Yalnız `/gonder sessiz` kalan çağrıları bildirimsiz kapatır.
+- Geri arama için bildirimden sonraki dış arama, aynı telefon ve aynı dahili/tam personel adı gerekir.
+- PBX sorgusu veya sayfalama başarısızsa rapor `Kontrol Edilemedi (PBX Hatası)` gösterir.
+- Yön bilgisi eksik kayıtlar geri arama kanıtı sayılmaz; canlı PBX yön alanı doğrulanmalıdır.
+- Manuel telefon eşlemesi API cache tarafından ezilmez. Eski telefon haritasında kaynak bilgisi
+     olmadığı için mevcut kayıtlar güvenli geçiş amacıyla manuel kabul edilir.
+- Excel hücrelerindeki formül benzeri metinler çalıştırılabilir formül olarak yazılmaz.
+
+### İzleme ve sınırlar
+
+Başarılı taramada `health.json` güncellenir. En az 5 dakika başarılı tarama olmazsa
+Telegram uyarısı üretilir; tekrar uyarılar 15 dakika aralıklıdır. Manuel yeniden
+gönderim sırasında bu kontrol askıdadır. Tamamen durmuş süreç kendi kendine uyarı
+veremez; Railway izleme ve harici heartbeat denetimi ayrıca kurulmalıdır.
+
+Loglarda telefon ve bilinen gizli anahtarlar maskelenir; gelen mesaj metinleri loglanmaz.
+JSON kayıtları ve raporlar kişisel veri içerir; volume erişimi ve yedekler korunmalıdır.
+Bekleyen çağrılar sessizce süre aşımına uğratılmaz; eski bekleyen günler için PBX veri
+erişimi gerekir. Telegram'ın mesajı kabul ettiği an ile yerel kayıt arasındaki ani
+süreç/disk arızasında mutlak tek-sefer teslim garantisi yoktur.
 
 ## Geliştirme
 
 ```bash
-pytest -q
+python -m pip check
+python -m pytest -q
 ```
+
+Testler geçici veri klasöründe çalışır; gerçek PBX ve Telegram ağ çağrıları engellenir.
+GitHub Actions Linux/Windows ve Python 3.11/3.14 matrisinde testleri çalıştırır.
+Üretime almadan önce test personeliyle DM, grup yetkisi, PBX yön alanı ve yeniden
+başlatma sonrası volume kalıcılığı ayrıca doğrulanmalıdır. Eski rapor kayıtları geçmiş
+sürümde grup teslimine göre oluşmuş olabilir; yeni DM kuralı geçmiş kayıtları geriye dönük doğrulamaz.
 
 ## Sorun Giderme
 
 | Belirti | Kontrol |
-|---------|---------|
+| --- | --- |
 | Bildirim yok | `/ping`, `/ayar`, `TONIVA_QUEUE`, API key scope |
 | Toniva 401/403 | Key, scope `reports:read`, IP whitelist |
 | Toniva 429 | Poll aralığını artır |

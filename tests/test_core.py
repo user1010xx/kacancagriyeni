@@ -309,6 +309,7 @@ def test_enrich_delivered_rows_ignores_calls_before_notification():
             "Phone": "905015322108",
             "Date": "2026-07-03",
             "Time": "13:21:18",
+            "Direction": "outbound",
             "Extension": "101",
             "ExtensionName": "doga",
         },
@@ -316,6 +317,7 @@ def test_enrich_delivered_rows_ignores_calls_before_notification():
             "Phone": "905015322108",
             "Date": "2026-07-03",
             "Time": "13:24:05",
+            "Direction": "outbound",
             "Extension": "101",
             "ExtensionName": "doga",
         },
@@ -399,6 +401,7 @@ def test_enrich_detects_callback_when_date_is_iso8601():
             "Time": "11:37:55",               # callback: 27s after notification
             "Extension": "105",
             "ExtensionName": "sergen -O",
+            "Direction": "outbound",
         }
     ]
     personnel_rows = [

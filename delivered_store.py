@@ -5,8 +5,9 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
+from json_storage import load_json, save_json
 
-_STORE_TZ = ZoneInfo("Europe/Istanbul")
+_STORE_TZ = ZoneInfo(os.getenv("BOT_TIMEZONE", "Europe/Istanbul"))
 
 
 class DeliveredStore:
@@ -22,22 +23,13 @@ class DeliveredStore:
         self._entries: list[dict[str, str]] = self._load()
 
     def _load(self) -> list[dict[str, str]]:
-        if not self.path.exists():
-            return []
-        try:
-            with self.path.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                return data
-        except Exception:
-            pass
-        return []
+        data = load_json(self.path, [], list)
+        if any(not isinstance(entry, dict) for entry in data):
+            raise ValueError("Geçersiz iletim kayıt yapısı")
+        return data
 
     def _save(self) -> None:
-        temp = self.path.with_suffix(".tmp")
-        with temp.open("w", encoding="utf-8") as f:
-            json.dump(self._entries, f, ensure_ascii=False, indent=2)
-        os.replace(temp, self.path)
+        save_json(self.path, self._entries)
 
     @staticmethod
     def _parse_entry_call_date(value: Any) -> date | None:
@@ -71,17 +63,20 @@ class DeliveredStore:
         personel_adi: str,
         call_date: date,
         notified_at: datetime | None = None,
+        dahili: str = "",
+        allow_repeat: bool = False,
     ) -> None:
-        when = notified_at or datetime.now()
+        when = notified_at or datetime.now(_STORE_TZ).replace(tzinfo=None)
         entry = {
             "call_key": call_key,
             "phone": str(phone).strip(),
             "personel_adi": str(personel_adi).strip(),
             "call_date": call_date.strftime("%Y-%m-%d"),
             "notified_at": when.strftime("%d.%m.%Y %H:%M:%S"),
+            "dahili": dahili,
         }
         with self._lock:
-            if any(e.get("call_key") == call_key for e in self._entries):
+            if not allow_repeat and any(e.get("call_key") == call_key for e in self._entries):
                 return
             self._entries.append(entry)
             self._save()

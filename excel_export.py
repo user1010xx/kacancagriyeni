@@ -13,10 +13,10 @@ def sort_calls(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
     def sort_key(call: dict[str, Any]):
         parsed = parse_call_datetime(call)
         if parsed:
-            return parsed
+            return (0, parsed)
         # Fallback to string
         d, t = _call_datetime(call)
-        return (d, t)
+        return (1, d, t)
     return sorted(calls, key=sort_key)
 
 
@@ -92,6 +92,8 @@ def export_missed_calls_excel(
 
         for col, value in enumerate(values, start=1):
             cell = sheet.cell(row=row_idx, column=col, value=value)
+            if isinstance(value, str):
+                cell.data_type = "s"
             cell.border = thin_border
             if col in (3, 4):  # date/time center
                 cell.alignment = center_align
@@ -145,6 +147,8 @@ def export_delivered_report_excel(
         ]
         for col, value in enumerate(values, start=1):
             cell = sheet.cell(row=row_idx, column=col, value=value)
+            if isinstance(value, str):
+                cell.data_type = "s"
             cell.border = thin_border
             if col == 3:
                 cell.alignment = center_align

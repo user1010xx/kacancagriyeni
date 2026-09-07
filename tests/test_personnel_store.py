@@ -58,7 +58,7 @@ def test_excel_bulk_save_once(tmp_path: Path):
     assert "105" in raw and "106" in raw
 
 
-def test_excel_bulk_preserves_chat_id_on_update(tmp_path: Path):
+def test_excel_bulk_resets_chat_id_when_username_changes(tmp_path: Path):
     from openpyxl import Workbook
 
     store = PersonnelStore(tmp_path / "personnels.json")
@@ -75,4 +75,20 @@ def test_excel_bulk_preserves_chat_id_on_update(tmp_path: Path):
     row = store.get("105")
     assert row["personel_adi"] == "Ali Yılmaz"
     assert row["telegram_username"] == "ali_new"
-    assert row["telegram_chat_id"] == "999"
+    assert row["telegram_chat_id"] == ""
+
+
+def test_same_username_preserves_link_and_different_user_cannot_claim(tmp_path):
+    store = PersonnelStore(tmp_path / "p.json")
+    store.add_or_update("101", "Deniz", "deniz", telegram_chat_id="111")
+    store.add_or_update("101", "Deniz Kaya", "@DENIZ")
+    assert store.get("101")["telegram_chat_id"] == "111"
+    assert store.link_chat_id_by_username("deniz", 222) == 0
+
+
+def test_full_name_priority_and_ambiguous_first_name(tmp_path):
+    store = PersonnelStore(tmp_path / "p.json")
+    store.add_or_update("101", "Ahmet Yilmaz", "ahmet_y")
+    store.add_or_update("102", "Ahmet Demir", "ahmet_d")
+    assert store.find_for_extension("Ahmet Demir")["telegram_username"] == "ahmet_d"
+    assert store.find_for_extension("Ahmet") is None

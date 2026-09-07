@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import re
 import time
@@ -825,6 +826,8 @@ def normalize_conversation_row(record: dict[str, Any]) -> dict[str, Any]:
         "ExtensionName": extension_name,
         "CompletedExtension": extension,
         "CompletedExtensionName": extension_name,
+        "Direction": _field(record, "Direction", "direction", "Yön", "Yon", "Arama Tipi", "Çağrı Tipi", "CallType"),
+        "EventType": _field(record, "EventType", "eventType"),
         "_source": "toniva",
     }
 
@@ -1094,35 +1097,12 @@ def _fetch_conversations_pages(
     meta_total: int | None = None
 
     for page in range(1, max_pages + 1):
-        try:
-            rows, meta = fetch_report(
-                "conversations",
-                start_date,
-                end_date,
-                page=page,
-                page_size=page_size,
-                min_call_duration=min_call_duration,
-                min_ring_duration=min_ring_duration,
-                timeout=timeout,
-            )
-        except TonivaError as exc:
-            # page/pageSize desteklenmiyorsa ilk sayfada paramsız dene
-            if page == 1:
-                logger.warning(
-                    "Toniva conversations sayfalı istek başarısız, paramsız denenecek: %s",
-                    exc,
-                )
-                rows, meta = fetch_report(
-                    "conversations",
-                    start_date,
-                    end_date,
-                    min_call_duration=min_call_duration,
-                    min_ring_duration=min_ring_duration,
-                    timeout=timeout,
-                )
-                all_rows.extend(rows)
-                break
-            raise
+        rows, meta = fetch_report(
+            "conversations", start_date, end_date, page=page, page_size=page_size,
+            min_call_duration=min_call_duration, min_ring_duration=min_ring_duration,
+            timeout=timeout,
+        )
+        truncated = str(meta.get("truncated", "false")).lower() == "true"
 
         if meta_total is None:
             raw_total = meta.get("total_count") or meta.get("totalCount") or meta.get("total")
@@ -1132,6 +1112,8 @@ def _fetch_conversations_pages(
                 meta_total = None
 
         if not rows:
+            if truncated:
+                raise TonivaError("Conversations boş ve eksik sayfa döndürdü")
             break
 
         new_count = 0
@@ -1144,12 +1126,7 @@ def _fetch_conversations_pages(
                 or row.get("CallID")
                 or row.get("id")
                 or row.get("ID")
-                or (
-                    f"{row.get('Phone') or row.get('phone') or row.get('Telefon')}"
-                    f"|{row.get('Date') or row.get('Tarih') or row.get('date')}"
-                    f"|{row.get('Time') or row.get('Saat') or row.get('time')}"
-                    f"|{row.get('Extension') or row.get('Dahili Numarası') or ''}"
-                )
+                or json.dumps(row, sort_keys=True, ensure_ascii=False, default=str)
             )
             if fp in seen_fingerprints:
                 continue
@@ -1170,21 +1147,16 @@ def _fetch_conversations_pages(
 
         if meta_total is not None and len(all_rows) >= meta_total:
             break
-        # Tam sayfa gelmediyse son sayfa
-        if len(rows) < page_size:
-            break
-        # Yeni satır yoksa döngü (API aynı sayfayı tekrarlıyor)
         if new_count == 0:
+            raise TonivaError("Conversations aynı sayfayı tekrarlıyor")
+        # Tam sayfa gelmediyse son sayfa
+        if len(rows) < page_size and not truncated:
             break
+    else:
+        raise TonivaError("Conversations sayfa sınırı aşıldı")
 
     if meta_total is not None and len(all_rows) < meta_total:
-        logger.warning(
-            "Toniva conversations eksik olabilir: fetched=%s meta_total=%s (%s…%s)",
-            len(all_rows),
-            meta_total,
-            start_date,
-            end_date,
-        )
+        raise TonivaError(f"Eksik conversations verisi: {len(all_rows)}/{meta_total}")
     return all_rows
 
 
@@ -1250,11 +1222,7 @@ def fetch_conversations(
                     len(day_rows),
                 )
             except Exception as exc:
-                logger.warning(
-                    "Toniva conversations gün başarısız %s: %s",
-                    day.isoformat(),
-                    exc,
-                )
+                raise TonivaError(f"Conversations alınamadı: {day.isoformat()}") from exc
             day += timedelta(days=1)
     else:
         raw_all = _fetch_conversations_pages(

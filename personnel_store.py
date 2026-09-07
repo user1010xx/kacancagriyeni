@@ -4,6 +4,8 @@ import threading
 from pathlib import Path
 
 from openpyxl import load_workbook
+from invekto_client import _normalize_person_text
+from json_storage import load_json, save_json
 
 
 class PersonnelStore:
@@ -17,21 +19,12 @@ class PersonnelStore:
         self._load()
 
     def _load(self) -> None:
-        if not self.path.exists():
-            return
-        try:
-            with self.path.open("r", encoding="utf-8") as f:
-                loaded = json.load(f)
-            if isinstance(loaded, dict):
-                self._data = loaded
-        except Exception:
-            self._data = {}
+        self._data = load_json(self.path, {}, dict)
+        if any(not isinstance(info, dict) for info in self._data.values()):
+            raise ValueError("Geçersiz personel kayıt yapısı")
 
     def _save(self) -> None:
-        temp_path = self.path.with_suffix(".tmp")
-        with temp_path.open("w", encoding="utf-8") as f:
-            json.dump(self._data, f, ensure_ascii=False, indent=2)
-        os.replace(temp_path, self.path)
+        save_json(self.path, self._data)
 
     def add_or_update(
         self,
@@ -46,20 +39,21 @@ class PersonnelStore:
         if not dahili:
             return False
 
-        existing = self._data.get(dahili, {})
-        chat_id = (
-            str(telegram_chat_id).strip()
-            if telegram_chat_id is not None
-            else existing.get("telegram_chat_id", "")
-        )
-
-        self._data[dahili] = {
-            "personel_adi": str(personel_adi).strip(),
-            "telegram_username": str(telegram_username).strip().lstrip("@"),
-            "telegram_chat_id": chat_id,
-        }
-        if save:
-            with self._lock:
+        username = str(telegram_username).strip().lstrip("@")
+        with self._lock:
+            existing = self._data.get(dahili, {})
+            same_user = username.casefold() == existing.get("telegram_username", "").casefold()
+            chat_id = (
+                str(telegram_chat_id).strip()
+                if telegram_chat_id is not None
+                else existing.get("telegram_chat_id", "") if same_user else ""
+            )
+            self._data[dahili] = {
+                "personel_adi": str(personel_adi).strip(),
+                "telegram_username": username,
+                "telegram_chat_id": chat_id,
+            }
+            if save:
                 self._save()
         return True
 
@@ -72,7 +66,8 @@ class PersonnelStore:
         with self._lock:
             for dahili, info in self._data.items():
                 stored = str(info.get("telegram_username", "")).strip().lstrip("@").casefold()
-                if stored and stored == normalized:
+                linked_id = str(info.get("telegram_chat_id") or "")
+                if stored == normalized and (not linked_id or linked_id == str(chat_id)):
                     info["telegram_chat_id"] = str(chat_id)
                     updated += 1
             if updated:
@@ -119,20 +114,22 @@ class PersonnelStore:
             if str(dahili).strip().casefold() == ext_cf:
                 return info
 
-        for info in self._data.values():
-            ad = str(info.get("personel_adi", "")).strip()
-            if not ad:
-                continue
-            if ad.casefold() == ext_cf or self._extension_token(ad) == ext_token:
-                return info
-
-            username = str(info.get("telegram_username", "")).strip().lstrip("@")
-            if username and (
-                username.casefold() == ext_cf
-                or self._extension_token(username) == ext_token
-            ):
-                return info
-
+        normalized = _normalize_person_text(ext)
+        matches = [
+            info for info in self._data.values()
+            if normalized in {
+                _normalize_person_text(info.get("personel_adi", "")),
+                _normalize_person_text(info.get("telegram_username", "")),
+            }
+        ]
+        if matches:
+            return matches[0] if len(matches) == 1 else None
+        if len(normalized.split()) == 1:
+            matches = [
+                info for info in self._data.values()
+                if self._extension_token(info.get("personel_adi", "")) == ext_token
+            ]
+            return matches[0] if len(matches) == 1 else None
         return None
 
     def get_all(self) -> list[dict[str, str]]:

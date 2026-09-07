@@ -1,8 +1,4 @@
-""" /gonder iş durumu — bellek + dosya (çoklu process / restart dayanıklı).
-
-Sorun: bellek bayrağı False iken arka plan veya poll hâlâ basabiliyordu;
-durdur 'iş yok' diyordu. Dosya + task iptali + poll kilidi ile düzeltilir.
-"""
+"""Tek süreçte /gonder durumu; yeniden başlatmada eski çalışma bayrakları sıfırlanır."""
 
 from __future__ import annotations
 
@@ -12,6 +8,7 @@ import threading
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
+from json_storage import load_json, save_json
 
 
 class GonderControl:
@@ -23,24 +20,14 @@ class GonderControl:
         self._mem_running = False
         self._mem_cancel = False
         self._dates: list[str] = []
+        if self.path.exists():
+            self.finish()
 
     def _read(self) -> dict[str, Any]:
-        if not self.path.exists():
-            return {"running": False, "cancel": False, "dates": []}
-        try:
-            with self.path.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            pass
-        return {"running": False, "cancel": False, "dates": []}
+        return load_json(self.path, {"running": False, "cancel": False, "dates": []}, dict)
 
     def _write(self, data: dict[str, Any]) -> None:
-        temp = self.path.with_suffix(".tmp")
-        with temp.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(temp, self.path)
+        save_json(self.path, data)
 
     def is_running(self) -> bool:
         with self._lock:
@@ -89,24 +76,17 @@ class GonderControl:
         with self._lock:
             file_state = self._read()
             was_running = self._mem_running or bool(file_state.get("running"))
-            self._mem_cancel = True
+            self._mem_cancel = was_running
             dates = list(self._dates) or list(file_state.get("dates") or [])
             self._write(
                 {
                     "running": was_running,
-                    "cancel": True,
+                    "cancel": was_running,
                     "dates": dates,
                     "started_at": file_state.get("started_at"),
                     "cancel_requested_at": datetime.now().isoformat(timespec="seconds"),
                 }
             )
-            task = self._task
-
-        if task is not None and not task.done():
-            try:
-                task.cancel()
-            except Exception:
-                pass
 
         if not was_running:
             return (
@@ -117,7 +97,7 @@ class GonderControl:
         return (
             True,
             "🛑 Durdurma isteği alındı.\n"
-            "Arka plan görevi iptal ediliyor; yeni mesaj kesilecek.\n"
+            "Devam eden gönderim tamamlanınca yeni çağrı işlenmeyecek.\n"
             "Gerekirse: /gonder sessiz",
         )
 
@@ -137,3 +117,8 @@ class GonderControl:
                 }
             )
             self._dates = []
+
+    async def wait_finished(self) -> None:
+        task = self._task
+        if task is not None:
+            await task

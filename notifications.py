@@ -4,6 +4,9 @@ from datetime import datetime as dtm
 from enum import Enum
 from typing import Any
 from zoneinfo import ZoneInfo
+import os
+from datetime import timedelta
+from telegram.error import RetryAfter
 
 from invekto_client import _call_datetime, _normalize_phone, call_key, call_key_variants
 
@@ -36,7 +39,7 @@ def lookup_dahili_from_cache(dahili_cache: dict, phone: str) -> str | None:
             return str(val).strip() or None
     return None
 
-_REPORT_TZ = ZoneInfo("Europe/Istanbul")
+_REPORT_TZ = ZoneInfo(os.getenv("BOT_TIMEZONE", "Europe/Istanbul"))
 logger = logging.getLogger(__name__)
 
 
@@ -82,14 +85,12 @@ def build_missed_call_context(
         "is_private_notified_any",
         lambda keys: False,
     )(key_variants)
-    if group_notified_before and private_notified_before:
-        return None
-
     phone = str(call.get("Phone") or "")
     call_time_str = build_call_time_str(call)
 
     # 1) bellek cache  2) kalıcı phone_map  3) yoksa NO_DAHILI
-    dahili = lookup_dahili_from_cache(dahili_cache, phone)
+    dahili = phone_map_store.lookup_manual(phone) if phone_map_store is not None else None
+    dahili = dahili or lookup_dahili_from_cache(dahili_cache, phone)
     if not dahili and phone_map_store is not None:
         try:
             dahili = phone_map_store.lookup(phone)
@@ -214,7 +215,20 @@ def should_mark_complete(ctx: MissedCallContext, *, private_ok: bool, group_ok: 
         return False
     if ctx.kind == NotifyKind.PERSONNEL:
         return private_ok
-    return True
+    return False
+
+
+async def send_with_retry(send, **kwargs):
+    import asyncio
+    for attempt in range(3):
+        try:
+            return await send(**kwargs)
+        except RetryAfter as exc:
+            if attempt == 2:
+                raise
+            delay = exc.retry_after
+            seconds = delay.total_seconds() if isinstance(delay, timedelta) else float(delay)
+            await asyncio.sleep(max(0.0, seconds) + 0.1)
 
 
 def counts_as_failed_dm(ctx: MissedCallContext, private_ok: bool) -> bool:
@@ -230,6 +244,8 @@ async def deliver_missed_call_notification(
     *,
     bot,
     target_chat_id: int,
+    on_private_sent=None,
+    on_group_sent=None,
 ) -> tuple[bool, bool, "dtm | None"]:
     """Özel ve grup bildirimini gönderir.
 
@@ -251,7 +267,7 @@ async def deliver_missed_call_notification(
         chat_id = private_chat_id(personnel)
         if chat_id:
             try:
-                await bot.send_message(chat_id=chat_id, text=private_text)
+                await send_with_retry(bot.send_message, chat_id=chat_id, text=private_text)
                 private_ok = True
             except Exception as exc:
                 chat_id_display = chat_id
@@ -264,11 +280,13 @@ async def deliver_missed_call_notification(
                     exc,
                 )
                 private_ok = False
+            if private_ok and on_private_sent is not None:
+                on_private_sent(dtm.now(_REPORT_TZ).replace(tzinfo=None))
 
     if should_send_group:
         group_text = build_group_text(ctx, private_ok=private_ok)
         try:
-            await bot.send_message(chat_id=target_chat_id, text=group_text)
+            await send_with_retry(bot.send_message, chat_id=target_chat_id, text=group_text)
             group_ok = True
             group_sent_at = dtm.now(_REPORT_TZ).replace(tzinfo=None)
         except Exception as exc:
@@ -281,5 +299,7 @@ async def deliver_missed_call_notification(
                 exc,
             )
             group_ok = False
+        if group_ok and on_group_sent is not None:
+            on_group_sent(group_sent_at)
 
     return private_ok, group_ok, group_sent_at

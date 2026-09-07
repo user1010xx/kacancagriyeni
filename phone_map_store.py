@@ -14,6 +14,7 @@ import os
 import re
 import threading
 from pathlib import Path
+from json_storage import load_json, save_json
 
 
 def normalize_phone_key(phone: str) -> str:
@@ -35,15 +36,18 @@ class PhoneMapStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._data: dict[str, str] = {}
+        self._manual: set[str] = set()
         self._load()
 
     def _load(self) -> None:
-        if not self.path.exists():
-            return
+        loaded = load_json(self.path, {}, dict)
         try:
-            with self.path.open("r", encoding="utf-8") as f:
-                loaded = json.load(f)
             if isinstance(loaded, dict):
+                if loaded.get("version") == 2:
+                    self._manual = set(loaded.get("manual", []))
+                    loaded = loaded.get("mapping", {})
+                else:
+                    self._manual = {normalize_phone_key(key) for key in loaded}
                 cleaned: dict[str, str] = {}
                 for k, v in loaded.items():
                     pk = normalize_phone_key(str(k))
@@ -51,14 +55,11 @@ class PhoneMapStore:
                     if pk and dahili:
                         cleaned[pk] = dahili
                 self._data = cleaned
-        except Exception:
-            self._data = {}
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ValueError("Geçersiz telefon eşleme kayıt yapısı") from exc
 
     def _save(self) -> None:
-        temp = self.path.with_suffix(".tmp")
-        with temp.open("w", encoding="utf-8") as f:
-            json.dump(self._data, f, ensure_ascii=False, indent=2, sort_keys=True)
-        os.replace(temp, self.path)
+        save_json(self.path, {"version": 2, "mapping": self._data, "manual": sorted(self._manual)})
 
     def lookup(self, phone: str) -> str | None:
         """Telefon için dahili; birden fazla anahtar varyantı dener."""
@@ -76,8 +77,9 @@ class PhoneMapStore:
         if not pk or not dahili_s:
             return False
         with self._lock:
-            if self._data.get(pk) == dahili_s:
+            if self._data.get(pk) == dahili_s and pk in self._manual:
                 return True
+            self._manual.add(pk)
             self._data[pk] = dahili_s
             if save:
                 self._save()
@@ -92,7 +94,7 @@ class PhoneMapStore:
             for phone, dahili in mapping.items():
                 pk = normalize_phone_key(phone)
                 dahili_s = str(dahili or "").strip()
-                if not pk or not dahili_s:
+                if not pk or not dahili_s or pk in self._manual:
                     continue
                 if self._data.get(pk) != dahili_s:
                     self._data[pk] = dahili_s
@@ -105,6 +107,11 @@ class PhoneMapStore:
         with self._lock:
             return dict(self._data)
 
+    def lookup_manual(self, phone: str) -> str | None:
+        key = normalize_phone_key(phone)
+        with self._lock:
+            return self._data.get(key) if key in self._manual else None
+
     def count(self) -> int:
         return len(self._data)
 
@@ -113,6 +120,7 @@ class PhoneMapStore:
         with self._lock:
             if pk in self._data:
                 del self._data[pk]
+                self._manual.discard(pk)
                 self._save()
                 return True
         return False

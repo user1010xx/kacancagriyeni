@@ -3,6 +3,7 @@ import logging
 import os
 import time
 import uuid
+from functools import wraps
 from datetime import date, datetime as dtm, timedelta, time as dt_time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -49,10 +50,13 @@ from notifications import (
     deliver_missed_call_notification,
     lookup_dahili_from_cache,
     should_mark_complete,
+    send_with_retry,
 )
 from gonder_control import GonderControl
 from phone_map_store import PhoneMapStore, normalize_phone_key
 from sent_store import SentStore
+from json_storage import save_json
+from privacy_logging import RedactingFormatter
 
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data"))).resolve()
 
@@ -67,7 +71,7 @@ def _configure_logging() -> None:
         return
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    log_formatter = logging.Formatter(
+    log_formatter = RedactingFormatter(
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
     root_logger = logging.getLogger()
@@ -95,6 +99,7 @@ delivered_store = DeliveredStore(DATA_DIR / "delivered_calls.json", retention_ho
 phone_map_store = PhoneMapStore(DATA_DIR / "phone_map.json")
 gonder_control = GonderControl(DATA_DIR / "gonder_state.json")
 _MISSED_CALL_PROCESS_LOCK = asyncio.Lock()
+_GONDER_COMMAND_LOCK = asyncio.Lock()
 
 # /gonder durdur | stop | iptal | cancel | sessiz
 _GONDER_STOP_TOKENS = frozenset(
@@ -191,20 +196,22 @@ def _pbx_not_ready_message() -> str:
     return "Önce /firmakodu komutu ile firma kodunu ayarlayın."
 
 
-def _record_delivered_notification(notify_ctx, group_sent_at: "dtm | None" = None) -> None:
+def _record_delivered_notification(notify_ctx, group_sent_at: "dtm | None" = None, *, replay: bool = False) -> None:
     personnel = notify_ctx.personnel or {}
     personel_adi = personnel.get("personel_adi", notify_ctx.dahili or "")
     # "İletilen çağrı" raporu, çağrının tarihi değil iletim zamanına göre gruplanır.
-    call_date = _report_today()
     # En doğru iletilen zaman: mesajın gerçekten Telegram'a gönderildiği an
-    # (deliver fonksiyonundan gelen group_sent_at). Bu, Telegram görünümü ile Excel'i birebir aynı yapar.
+    # Başarılı özel mesaj gönderiminin yerel zamanını kullanır.
     notified_at_local = group_sent_at or dtm.now(REPORT_TZ).replace(tzinfo=None)
+    call_date = notified_at_local.date()
     delivered_store.add(
         call_key=notify_ctx.key,
         phone=notify_ctx.phone,
         personel_adi=personel_adi,
         call_date=call_date,
         notified_at=notified_at_local,
+        dahili=notify_ctx.dahili or "",
+        allow_repeat=replay,
     )
 
 
@@ -248,13 +255,13 @@ async def _build_delivered_report_rows(target_date: date, rows: list[dict]) -> l
     # iletilen tarihin 1 gün öncesinden bugüne (+1) kadar conversation çekiyoruz.
     # Zenginleştirme içindeki zaman filtresi sadece iletilen sonrası olanları alır.
     conv_start = target_date - timedelta(days=1)
-    conv_end = _report_today() + timedelta(days=1)
-    conversations = await asyncio.to_thread(
-        fetch_conversations,
-        company_code,
-        conv_start,
-        conv_end,
-    )
+    try:
+        conversations = await asyncio.to_thread(
+            fetch_conversations, company_code, conv_start, _report_today(),
+        )
+    except Exception:
+        logger.exception("Geri arama kontrolü için PBX verisi alınamadı")
+        return [{**row, "callback_status": "Kontrol Edilemedi (PBX Hatası)"} for row in rows]
     return enrich_delivered_rows_with_callback_status(
         rows,
         conversations,
@@ -296,18 +303,19 @@ def _cutoff_time_for_date(target_date: date) -> str | None:
     return None
 
 
-def _apply_time_cutoff(calls: list, target_date: date, cutoff: str) -> list:
+def _apply_time_cutoff(calls: list, target_date: date, cutoff: str, *, delivery_state=None) -> list:
     """Cutoff öncesi çağrıları bildirmeden sent_store'a işler; sonrasını döndürür."""
     before, after = split_calls_by_time(calls, cutoff)
+    state = delivery_state if delivery_state is not None else sent_store
     skipped = 0
     for call in before:
         keys = call_key_variants(call)
-        if not sent_store.is_complete_any(keys):
-            sent_store.mark_complete_keys(keys, save=False)
+        if not state.is_complete_any(keys):
+            state.mark_complete_keys(keys, save=False)
             skipped += 1
 
     if skipped:
-        sent_store.flush()
+        state.flush()
         logger.info(
             "%s saat filtresi <%s: %s çağrı bildirilmeden işlendi",
             target_date.isoformat(),
@@ -351,12 +359,10 @@ async def log_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     chat = update.effective_chat
     if not chat:
         return
-    text = update.effective_message.text if update.effective_message else "-"
     logger.info(
-        "Gelen update: chat_id=%s chat_type=%s text=%s",
+        "Gelen update: chat_id=%s chat_type=%s",
         chat.id,
         chat.type,
-        text,
     )
 
 
@@ -522,10 +528,13 @@ async def personel_excel_handler(update: Update, context: ContextTypes.DEFAULT_T
     await update.message.reply_text("Excel işleniyor, lütfen bekleyin...")
 
     file = await context.bot.get_file(doc.file_id)
-    temp_path = DATA_DIR / "temp_personel_upload.xlsx"
-    await file.download_to_drive(temp_path)
+    temp_path = DATA_DIR / f"personel_upload_{uuid.uuid4().hex}.xlsx"
 
     try:
+        if doc.file_size and doc.file_size > 5 * 1024 * 1024:
+            await update.message.reply_text("Excel dosyası en fazla 5 MB olabilir.")
+            return
+        await file.download_to_drive(temp_path)
         before = personnel_store.count()
         count = personnel_store.load_from_excel(temp_path)
         after = personnel_store.count()
@@ -700,7 +709,7 @@ async def kacancagri_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "Excel dosyası hazırlanıyor..."
         )
         with export_path.open("rb") as excel_file:
-            await update.message.reply_document(
+            await send_with_retry(update.message.reply_document,
                 document=excel_file,
                 filename=filename,
                 caption=f"Toplam {len(calls)} kaçan çağrı",
@@ -780,35 +789,25 @@ async def _run_gonder_job(
 
     date_labels = ", ".join(d.strftime("%d.%m.%Y") for d in target_dates)
     cancelled = False
-    cleared_dedup = 0
-    cleared_delivered = 0
     total_sent = 0
     total_failed_dm = 0
     day_lines: list[str] = []
+    replay_path = DATA_DIR / f"replay_{uuid.uuid4().hex}.json"
 
     try:
         _dahili_cache = {}
         _dahili_cache_built_at = None
 
-        date_set = set(target_dates)
-        cleared_dedup = sent_store.unmark_for_dates(date_set)
-        cleared_delivered = delivered_store.remove_by_call_key_dates(date_set)
-        logger.info(
-            "/gonder dedup temizlendi: dates=%s removed_dedup=%s removed_delivered=%s",
-            date_labels,
-            cleared_dedup,
-            cleared_delivered,
-        )
+        replay_state = SentStore(replay_path, max_age_days=0)
+        logger.info("/gonder yeniden iletim başladı: dates=%s", date_labels)
 
         if _gonder_should_stop():
             cancelled = True
-            # Dedup açıldıysa poll flood olmasın
-            silenced = await _silence_dates_without_notify(target_dates)
             await bot.send_message(
                 chat_id=chat_id,
                 text=(
                     "🛑 /gonder durduruldu (iletim başlamadan).\n"
-                    f"Bildirimsiz kapatılan: {silenced}"
+                    "Mevcut kayıtlar korundu."
                 ),
             )
             return
@@ -835,6 +834,7 @@ async def _run_gonder_job(
                     context=context,
                     throttle_seconds=throttle,
                     should_cancel=_gonder_should_stop,
+                    delivery_state=replay_state,
                 )
             except asyncio.CancelledError:
                 cancelled = True
@@ -866,14 +866,11 @@ async def _run_gonder_job(
             )
 
         if cancelled:
-            # Kalanları bildirimsiz kapat — normal poll tekrar basmasın
-            silenced = await _silence_dates_without_notify(target_dates)
             summary = (
                 f"🛑 Yeniden iletim DURDURULDU\n"
                 f"Günler: {date_labels}\n"
-                f"Temizlenen dedup: {cleared_dedup}\n"
                 f"Durana kadar bildirim: {total_sent}\n"
-                f"Bildirimsiz kapatılan (flood önlemi): {silenced}\n"
+                "Mevcut iletim geçmişi korundu.\n"
                 f"Başarısız DM: {total_failed_dm}\n\n"
                 + ("\n".join(day_lines) if day_lines else "• henüz gün işlenmedi")
             )
@@ -881,8 +878,7 @@ async def _run_gonder_job(
             summary = (
                 f"✅ Yeniden iletim bitti\n"
                 f"Günler: {date_labels}\n"
-                f"Temizlenen dedup: {cleared_dedup}\n"
-                f"Temizlenen iletilen kayıt: {cleared_delivered}\n"
+                "Mevcut iletim geçmişi korundu.\n"
                 f"Toplam tamamlanan bildirim: {total_sent}\n"
                 f"Başarısız DM: {total_failed_dm}\n\n"
                 + "\n".join(day_lines)
@@ -891,12 +887,11 @@ async def _run_gonder_job(
     except asyncio.CancelledError:
         logger.info("/gonder task iptal edildi (CancelledError)")
         try:
-            silenced = await _silence_dates_without_notify(target_dates)
             await bot.send_message(
                 chat_id=chat_id,
                 text=(
                     f"🛑 /gonder iptal edildi.\n"
-                    f"Bildirimsiz kapatılan: {silenced}"
+                    "Mevcut kayıtlar korundu."
                 ),
             )
         except Exception:
@@ -912,10 +907,20 @@ async def _run_gonder_job(
             pass
     finally:
         gonder_control.finish()
+        replay_path.unlink(missing_ok=True)
+        replay_path.with_suffix(".json.bak").unlink(missing_ok=True)
 
 
 async def gonder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Seçili günlerin kaçan çağrılarını dedup temizleyip sırayla yeniden iletir.
+    if _is_gonder_stop_request(context.args):
+        await _gonder_command(update, context)
+        return
+    async with _GONDER_COMMAND_LOCK:
+        await _gonder_command(update, context)
+
+
+async def _gonder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Seçili günleri mevcut geçmişi koruyarak sırayla yeniden iletir.
 
     Kullanım:
       /gonder 20.07.2026,21.07.2026
@@ -940,8 +945,13 @@ async def gonder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(
             "🔇 Kalan kayıtlar bildirimsiz kapatılıyor..."
         )
-        silenced = await _silence_dates_without_notify(dates)
-        gonder_control.finish()
+        await gonder_control.wait_finished()
+        gonder_control.begin(dates)
+        try:
+            async with _MISSED_CALL_PROCESS_LOCK:
+                silenced = await _silence_dates_without_notify(dates)
+        finally:
+            gonder_control.finish()
         await update.message.reply_text(
             f"🔇 Sessizleştirme bitti.\n"
             f"Günler: {', '.join(d.strftime('%d.%m.%Y') for d in dates)}\n"
@@ -961,7 +971,7 @@ async def gonder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "• /gonder 20.07.2026,21.07.2026 — seçili günleri yeniden ilet\n"
             "• /gonder durdur — çalışan iletimi durdur\n"
             "• /gonder sessiz — kalanları bildirimsiz kapat (flood durdur)\n\n"
-            "⚠️ Dedup temizlenir; personel eşleşmezse 'bulunamadı' yağabilir.\n"
+            "⚠️ Seçili günler yeniden bildirilir; önceki raporlar korunur.\n"
             "Eşleme yoksa önce /eslestir kullanın."
         )
         return
@@ -992,14 +1002,6 @@ async def gonder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     date_labels = ", ".join(d.strftime("%d.%m.%Y") for d in target_dates)
     chat_id = update.effective_chat.id
     gonder_control.begin(target_dates)
-    await update.message.reply_text(
-        f"📤 Yeniden iletim başlıyor (arka plan)\n"
-        f"Günler: {date_labels}\n"
-        f"⛔ Durdur: /gonder durdur\n"
-        f"🔇 Flood kes: /gonder sessiz\n"
-        f"Bu işlem birkaç dakika sürebilir..."
-    )
-
     # Handler hemen bitsin → /gonder durdur işlenebilsin
     task = context.application.create_task(
         _run_gonder_job(
@@ -1011,6 +1013,10 @@ async def gonder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         update=update,
     )
     gonder_control.attach_task(task)
+    await update.message.reply_text(
+        f"Yeniden iletim başlıyor: {date_labels}\n"
+        "Durdur: /gonder durdur\nSessizleştir: /gonder sessiz"
+    )
 
 
 async def eslestir_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1193,7 +1199,7 @@ async def iletilenkacancagri_command(update: Update, context: ContextTypes.DEFAU
             )
 
         with export_path.open("rb") as excel_file:
-            await update.message.reply_document(
+            await send_with_retry(update.message.reply_document,
                 document=excel_file,
                 filename=filename,
                 caption=caption,
@@ -1218,6 +1224,7 @@ async def _process_missed_calls_for_date(
     throttle_seconds: float = 0.0,
     after_time: str | None = None,
     should_cancel=None,
+    delivery_state=None,
 ) -> tuple[int, int]:
     """Belirli bir günün kaçan çağrılarını işler. (bildirilen_sayı, başarısız_dm)
 
@@ -1225,9 +1232,10 @@ async def _process_missed_calls_for_date(
     (/gonder durdur için).
     """
     async with _MISSED_CALL_PROCESS_LOCK:
+        state = delivery_state if delivery_state is not None else sent_store
         company_code = _require_company_code()
         if not company_code:
-            return 0, 0
+            raise PbxError("PBX yapılandırması eksik")
 
         if should_cancel and should_cancel():
             return 0, 0
@@ -1260,16 +1268,17 @@ async def _process_missed_calls_for_date(
             )
             if context is not None:
                 _update_bot_data(context, last_poll_error=str(exc))
-            return 0, 0
+            raise PbxError("Kaçan çağrı sorgusu başarısız") from exc
 
         if should_cancel and should_cancel():
             return 0, 0
 
-        calls = dedupe_calls_by_key(calls)
+        calls = dedupe_calls_by_key(calls + state.pending_calls(target_date))
+        state.remember_calls(calls)
 
         cutoff = after_time or _cutoff_time_for_date(target_date)
         if cutoff:
-            calls = _apply_time_cutoff(calls, target_date, cutoff)
+            calls = _apply_time_cutoff(calls, target_date, cutoff, delivery_state=state)
 
         global _dahili_cache, _dahili_cache_built_at
         now_mono = dtm.now()
@@ -1303,7 +1312,7 @@ async def _process_missed_calls_for_date(
                 call,
                 dahili_cache=dahili_cache,
                 personnel_store=personnel_store,
-                sent_store=sent_store,
+                sent_store=state,
                 phone_map_store=phone_map_store,
             )
             if notify_ctx is None:
@@ -1311,31 +1320,34 @@ async def _process_missed_calls_for_date(
 
             key_variants = call_key_variants(call)
 
+            def record_private(sent_at):
+                _record_delivered_notification(notify_ctx, group_sent_at=sent_at, replay=state is not sent_store)
+                state.mark_private_notified_keys(key_variants)
+                if state is not sent_store and not sent_store.is_complete_any(key_variants):
+                    sent_store.remember_calls([call])
+                    sent_store.mark_private_notified_keys(key_variants)
+
+            def record_group(sent_at):
+                state.mark_group_notified_keys(key_variants)
+                if state is not sent_store and not sent_store.is_complete_any(key_variants):
+                    sent_store.remember_calls([call])
+                    sent_store.mark_group_notified_keys(key_variants)
+
             private_ok, group_ok, group_sent_at = await deliver_missed_call_notification(
                 notify_ctx,
                 bot=bot,
                 target_chat_id=config.target_chat_id,
+                on_private_sent=record_private,
+                on_group_sent=record_group,
             )
 
             if counts_as_failed_dm(notify_ctx, private_ok):
                 failed_dm += 1
 
-            if group_ok and not notify_ctx.group_notified_before:
-                sent_store.mark_group_notified_keys(key_variants, save=True)
-                # Sadece gerçek personel eşleşmesi olan iletimleri "personele iletilen" kaydına al.
-                # Böylece Excel raporunda personel adı boş veya "bilinmiyor" satırlar olmaz.
-                if notify_ctx.kind == NotifyKind.PERSONNEL:
-                    _record_delivered_notification(notify_ctx, group_sent_at=group_sent_at)
-
-            if (
-                notify_ctx.kind == NotifyKind.PERSONNEL
-                and private_ok
-                and not notify_ctx.private_notified_before
-            ):
-                sent_store.mark_private_notified_keys(key_variants, save=True)
-
             if should_mark_complete(notify_ctx, private_ok=private_ok, group_ok=group_ok):
-                sent_store.mark_complete_keys(key_variants, save=True)
+                state.mark_complete_keys(key_variants, save=True)
+                if state is not sent_store:
+                    sent_store.mark_complete_keys(key_variants, save=True)
                 sent_now += 1
 
             if throttle_seconds > 0:
@@ -1356,15 +1368,58 @@ async def poll_missed_calls(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     _purge_delivered_store_by_retention_window()
 
-    sent_now, failed_dm = await _process_missed_calls_for_date(
-        context.bot,
-        _report_today(),
-        context=context,
-    )
+    today = _report_today()
+    dates = {today, today - timedelta(days=1)} | sent_store.pending_dates()
+    if _env_flag("BACKFILL_ON_STARTUP", default=True):
+        after_time = os.getenv("BACKFILL_AFTER_TIME", "14:57:00").strip() or None
+        for raw in os.getenv("BACKFILL_DATES", "").split(","):
+            try:
+                target = dtm.strptime(raw.strip(), "%d.%m.%Y").date()
+            except ValueError:
+                continue
+            if target <= today and not config.is_backfilled(target, after_time):
+                dates.add(target)
+    last_day = config.last_poll_date
+    if last_day is not None:
+        day = max(last_day, today - timedelta(days=sent_store.max_age_days))
+        while day < today:
+            dates.add(day)
+            day += timedelta(days=1)
+    sent_now = failed_dm = 0
+    success = True
+    poll_error = "-"
+    for target in sorted(dates, reverse=True):
+        try:
+            sent_count, failed_count = await _process_missed_calls_for_date(context.bot, target, context=context)
+            sent_now += sent_count
+            failed_dm += failed_count
+            cutoff = _cutoff_time_for_date(target)
+            if cutoff and not sent_store.pending_calls(target):
+                config.mark_backfilled(target, cutoff)
+        except Exception as exc:
+            success = False
+            poll_error = str(exc)
+            logger.exception("Poll başarısız")
+    if success:
+        config.last_poll_date = today
+        context.bot_data["last_poll_success_monotonic"] = time.monotonic()
+        save_json(DATA_DIR / "health.json", {
+            "last_success_at": dtm.now(REPORT_TZ).isoformat(),
+            "pending_dates": sorted(day.isoformat() for day in sent_store.pending_dates()),
+        })
+    else:
+        last_alert = context.bot_data.get("last_poll_alert", 0)
+        if time.monotonic() - last_alert >= 900:
+            context.bot_data["last_poll_alert"] = time.monotonic()
+            try:
+                await send_with_retry(context.bot.send_message, chat_id=config.target_chat_id, text="Çağrı taramasında hata var; bekleyen kayıtlar korunuyor. /stats ile kontrol edin.")
+            except Exception:
+                logger.exception("Poll hata uyarısı gönderilemedi")
 
     _update_bot_data(
         context,
         last_poll_count=sent_now,
+        last_poll_error=poll_error,
         last_poll_time=dtm.now(REPORT_TZ).strftime("%d.%m.%Y %H:%M:%S"),
         failed_dm_count=context.bot_data.get("failed_dm_count", 0) + failed_dm
         if context.bot_data
@@ -1388,7 +1443,7 @@ async def _seed_today_missed_calls_if_needed() -> int:
         return 0
 
     force = _env_flag("SEED_TODAY_FORCE", default=False)
-    if sent_store.count() > 0 and not force:
+    if (sent_store.count() > 0 or sent_store.pending_dates()) and not force:
         logger.info(
             "Dedup deposu dolu (%s kayıt); bugün seed atlandı. "
             "Zorlamak için SEED_TODAY_FORCE=true.",
@@ -1401,7 +1456,7 @@ async def _seed_today_missed_calls_if_needed() -> int:
         calls = await asyncio.to_thread(
             fetch_missed_calls,
             company_code,
-            today,
+            today - timedelta(days=1),
             today,
             uncompleted_only=False,
             **_fetch_kwargs(),
@@ -1419,6 +1474,7 @@ async def _seed_today_missed_calls_if_needed() -> int:
             seeded += 1
     if seeded:
         sent_store.flush()
+    config.last_poll_date = today
     logger.info(
         "Bugün seed tamamlandı: %s çağrı bildirimsiz işlendi (tarih=%s).",
         seeded,
@@ -1471,7 +1527,8 @@ async def _backfill_missed_calls(application: Application) -> None:
             throttle_seconds=throttle,
             after_time=after_time,
         )
-        config.mark_backfilled(target, after_time)
+        if not sent_store.pending_calls(target):
+            config.mark_backfilled(target, after_time)
         logger.info(
             "Backfill tamamlandı: %s | bildirim=%s | başarısız_dm=%s",
             job_key,
@@ -1484,6 +1541,25 @@ async def purge_old_sent_calls(context: ContextTypes.DEFAULT_TYPE) -> None:
     removed = sent_store.purge_old()
     if removed:
         logger.info("Periyodik temizlik: %s eski dedup kaydı silindi.", removed)
+
+
+async def check_poll_health(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if gonder_control.is_running():
+        return
+    now = time.monotonic()
+    baseline = context.bot_data.setdefault("last_poll_success_monotonic", now)
+    stale_after = max(300, config.polling_interval_seconds * 5)
+    if now - baseline < stale_after:
+        return
+    if now - context.bot_data.get("last_health_alert", float("-inf")) < 900:
+        return
+    context.bot_data["last_health_alert"] = now
+    logger.error("Başarılı çağrı taraması gecikti: %s saniye", int(now - baseline))
+    try:
+        await send_with_retry(context.bot.send_message, chat_id=config.target_chat_id,
+                              text="Başarılı çağrı taraması gecikti. /stats ve servis loglarını kontrol edin.")
+    except Exception:
+        logger.exception("Sağlık uyarısı gönderilemedi")
 
 
 async def send_daily_delivered_report(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1518,7 +1594,7 @@ async def send_daily_delivered_report(context: ContextTypes.DEFAULT_TYPE) -> Non
             f"Toplam: {len(rows)}"
         )
         with export_path.open("rb") as excel_file:
-            await context.bot.send_document(
+            await send_with_retry(context.bot.send_document,
                 chat_id=config.target_chat_id,
                 document=excel_file,
                 filename=filename,
@@ -1562,6 +1638,25 @@ async def post_init(application: Application) -> None:
         logger.warning("Backfill işlemi başarısız: %s", exc)
 
 
+def admin_only(callback):
+    @wraps(callback)
+    async def guarded(update, context):
+        user = update.effective_user
+        chat = update.effective_chat
+        if not user or not chat or chat.id != config.target_chat_id:
+            return
+        try:
+            member = await context.bot.get_chat_member(chat.id, user.id)
+        except Exception:
+            await update.effective_message.reply_text("Yönetici yetkisi doğrulanamadı; işlem yapılmadı.")
+            return
+        if member.status not in {"creator", "administrator"}:
+            await update.effective_message.reply_text("Bu işlem yalnızca grup yöneticilerine açıktır.")
+            return
+        return await callback(update, context)
+    return guarded
+
+
 def main() -> None:
     missing = config.validate()
     if missing:
@@ -1582,6 +1677,7 @@ def main() -> None:
     )
 
     application.bot_data.setdefault("failed_dm_count", 0)
+    application.bot_data["last_poll_success_monotonic"] = time.monotonic()
 
     application.add_handler(TypeHandler(Update, log_update), group=-1)
     application.add_handler(CommandHandler("start", private_start_command, filters=private_only))
@@ -1591,18 +1687,18 @@ def main() -> None:
     application.add_handler(CommandHandler("help", start_command, filters=allowed))
     application.add_handler(CommandHandler("ayar", ayar_command, filters=allowed))
     application.add_handler(CommandHandler("stats", stats_command, filters=allowed))
-    application.add_handler(CommandHandler("temizle", temizle_command, filters=allowed))
-    application.add_handler(CommandHandler("firmakodu", firmakodu_command, filters=allowed))
+    application.add_handler(CommandHandler("temizle", admin_only(temizle_command), filters=allowed))
+    application.add_handler(CommandHandler("firmakodu", admin_only(firmakodu_command), filters=allowed))
     application.add_handler(CommandHandler("kuyruklar", kuyruklar_command, filters=allowed))
     application.add_handler(CommandHandler("kacancagri", kacancagri_command, filters=allowed))
     application.add_handler(CommandHandler("iletilenkacancagri", iletilenkacancagri_command, filters=allowed))
-    application.add_handler(CommandHandler("gonder", gonder_command, filters=allowed))
-    application.add_handler(CommandHandler("eslestir", eslestir_command, filters=allowed))
-    application.add_handler(CommandHandler("debugeslesme", debugeslesme_command, filters=allowed))
-    application.add_handler(CommandHandler("personelekle", personelekle_command, filters=allowed))
-    application.add_handler(CommandHandler("personelsil", personelsil_command, filters=allowed))
-    application.add_handler(CommandHandler("personeller", personeller_command, filters=allowed))
-    application.add_handler(MessageHandler(filters.Document.ALL & allowed, personel_excel_handler))
+    application.add_handler(CommandHandler("gonder", admin_only(gonder_command), filters=allowed))
+    application.add_handler(CommandHandler("eslestir", admin_only(eslestir_command), filters=allowed))
+    application.add_handler(CommandHandler("debugeslesme", admin_only(debugeslesme_command), filters=allowed))
+    application.add_handler(CommandHandler("personelekle", admin_only(personelekle_command), filters=allowed))
+    application.add_handler(CommandHandler("personelsil", admin_only(personelsil_command), filters=allowed))
+    application.add_handler(CommandHandler("personeller", admin_only(personeller_command), filters=allowed))
+    application.add_handler(MessageHandler(filters.Document.ALL & allowed, admin_only(personel_excel_handler)))
 
     application.add_error_handler(error_handler)
 
@@ -1617,6 +1713,7 @@ def main() -> None:
         time=dt_time(hour=3, minute=0, tzinfo=REPORT_TZ),
         name="sent-store-purge",
     )
+    application.job_queue.run_repeating(check_poll_health, interval=60, first=60, name="poll-health")
     application.job_queue.run_daily(
         send_daily_delivered_report,
         time=dt_time(hour=DAILY_REPORT_HOUR, minute=0, tzinfo=REPORT_TZ),

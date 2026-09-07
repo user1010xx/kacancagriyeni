@@ -4,6 +4,7 @@ import threading
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from json_storage import load_json, save_json
 
 
 def _calendar_today() -> date:
@@ -21,6 +22,7 @@ class SentStore:
         self.max_age_days = max_age_days
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        self._pending: dict[str, dict] = {}
         self._completed, self._group_notified, self._private_notified = self._load()
         self._dirty = False
 
@@ -39,16 +41,12 @@ class SentStore:
         cleaned = set()
         for k in keys:
             kd = self._extract_date_from_key(k)
-            if kd is None or kd >= cutoff:
+            if kd is None or kd >= cutoff or k in self._pending:
                 cleaned.add(k)
         return cleaned
 
     def _load(self) -> tuple[set[str], set[str], set[str]]:
-        if not self.path.exists():
-            return set(), set(), set()
-
-        with self.path.open("r", encoding="utf-8") as file:
-            data = json.load(file)
+        data = load_json(self.path, {}, (dict, list))
 
         if isinstance(data, list):
             raw_completed = set(data)
@@ -56,6 +54,9 @@ class SentStore:
             raw_private: set[str] = set()
             needs_save = True
         elif isinstance(data, dict):
+            self._pending = data.get("pending", {})
+            if not isinstance(self._pending, dict) or any(not isinstance(call, dict) for call in self._pending.values()):
+                raise ValueError("Geçersiz bekleyen çağrı kayıt yapısı")
             raw_completed = set(data.get("completed", []))
             raw_group = set(data.get("group_notified", []))
             raw_private = set(data.get("private_notified", []))
@@ -84,14 +85,12 @@ class SentStore:
 
     def _save(self) -> None:
         payload = {
+            "pending": self._pending,
             "completed": sorted(self._completed),
             "group_notified": sorted(self._group_notified),
             "private_notified": sorted(self._private_notified),
         }
-        temp_path = self.path.with_suffix(".tmp")
-        with temp_path.open("w", encoding="utf-8") as file:
-            json.dump(payload, file, ensure_ascii=False, indent=2)
-        os.replace(temp_path, self.path)
+        save_json(self.path, payload)
         self._dirty = False
 
     def flush(self) -> None:
@@ -136,6 +135,7 @@ class SentStore:
 
     def mark_complete(self, key: str, *, save: bool = True) -> None:
         with self._lock:
+            self._pending.pop(key, None)
             self._completed.add(key)
             self._group_notified.discard(key)
             self._private_notified.discard(key)
@@ -146,6 +146,7 @@ class SentStore:
     def mark_complete_keys(self, keys: list[str], *, save: bool = True) -> None:
         with self._lock:
             for key in keys:
+                self._pending.pop(key, None)
                 self._completed.add(key)
                 self._group_notified.discard(key)
                 self._private_notified.discard(key)
@@ -174,6 +175,8 @@ class SentStore:
 
     def add_many(self, keys: list[str], *, save: bool = True) -> None:
         with self._lock:
+            for key in keys:
+                self._pending.pop(key, None)
             self._completed.update(keys)
             self._group_notified.difference_update(keys)
             self._private_notified.difference_update(keys)
@@ -183,6 +186,25 @@ class SentStore:
 
     def count(self) -> int:
         return len(self._completed)
+
+    def remember_calls(self, calls: list[dict]) -> None:
+        from invekto_client import call_key, call_key_variants
+        with self._lock:
+            for call in calls:
+                if not self.is_complete_any(call_key_variants(call)):
+                    self._pending[call_key(call)] = dict(call)
+                    self._dirty = True
+            if self._dirty:
+                self._save()
+
+    def pending_calls(self, target: date) -> list[dict]:
+        with self._lock:
+            return [dict(call) for key, call in self._pending.items() if self._extract_date_from_key(key) == target]
+
+    def pending_dates(self) -> set[date]:
+        with self._lock:
+            keys = set(self._pending) | self._group_notified | self._private_notified
+            return {day for key in keys if (day := self._extract_date_from_key(key)) is not None}
 
     def group_notified_count(self) -> int:
         return len(self._group_notified)

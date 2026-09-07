@@ -536,24 +536,15 @@ def _person_tokens(value: Any) -> list[str]:
 
 
 def _person_name_matches(left: Any, right: Any) -> bool:
-    left_tokens = _person_tokens(left)
-    right_tokens = _person_tokens(right)
-    if not left_tokens or not right_tokens:
-        return False
+    left_name = _normalize_person_text(left)
+    return bool(left_name and left_name == _normalize_person_text(right))
 
-    left_join = " ".join(left_tokens)
-    right_join = " ".join(right_tokens)
-    if left_join == right_join:
-        return True
 
-    for a in left_tokens:
-        for b in right_tokens:
-            if a == b:
-                return True
-            # "elcin-k" / "elci" gibi kısmi eşleşmeler için kontrollü prefix
-            if len(a) >= 4 and len(b) >= 4 and (a.startswith(b) or b.startswith(a)):
-                return True
-    return False
+def is_outbound_conversation(record: dict[str, Any]) -> bool:
+    direction = _normalize_person_text(record.get("Direction") or record.get("direction") or "")
+    if direction:
+        return direction in {"out", "outbound", "outgoing", "dis arama", "giden", "giden arama"}
+    return str(record.get("EventType") or "").strip() == "1"
 
 
 def _parse_conversation_datetime(date_value: Any, time_value: Any) -> datetime:
@@ -605,33 +596,35 @@ def enrich_delivered_rows_with_callback_status(
     rows: list[dict[str, Any]],
     conversations: list[dict[str, Any]],
     personnel_rows: list[dict[str, Any]] | None = None,
+    *,
+    now: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """İletilen çağrı satırlarına geri arama durumunu ekler.
 
     Kurallar (kullanıcının istediği davranış):
-    - Conversation'lar iletilen tarihten raporun çekildiği ana kadar (bugün+1) aranır.
+    - Dış aramalar iletilen tarihten raporun çekildiği ana kadar aranır.
     - **Sadece iletilen notified_at zamanından sonraki** aramalar dikkate alınır.
       iletilen saati öncesi (hatta tam aynı saniye) olanlar yok sayılır.
-    - Küçük sistem saat farkı için max 60 saniye tolerans.
-    - Eşleşme: telefon + personel (dahili veya ExtensionName fuzzy).
+    - Eşleşme: telefon + personel (dahili veya normalize edilmiş tam ad).
     - Bulunan ilk (en erken) geri arama "Aradı - dd.mm.yyyy HH:MM:SS" olarak gösterilir.
     - Rapor çekildiği ana kadar herhangi bir zamanda arama yapılmışsa "Aradı" yazar.
     """
     personnel_rows = personnel_rows or []
+    if now is None:
+        import os
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo(os.getenv("BOT_TIMEZONE", "Europe/Istanbul"))).replace(tzinfo=None)
 
     prepared: list[dict[str, Any]] = []
     for rec in conversations:
+        if not is_outbound_conversation(rec):
+            continue
         when = _parse_conversation_datetime(
             rec.get("Date") or rec.get("ChekInDate") or rec.get("CreateDate") or "",
             rec.get("Time") or rec.get("ChekInTime") or rec.get("CreateTime") or "",
         )
-        if when == datetime.min:
+        if when == datetime.min or when > now:
             continue
-
-        # Daha esnek: Artık EventType/ Direction filtresi yapmıyoruz.
-        # Çünkü bazı outgoing callback kayıtlarında EventType farklı olabiliyor.
-        # Seçimi tamamen telefon + personel (extension / extension_name) + zaman > iletilen ile yapıyoruz.
-        # Bu, Invekto'da görülen tüm ilgili kayıtları yakalamayı sağlar.
 
         phone_val = rec.get("Phone") or rec.get("phone") or rec.get("CalledNumber") or ""
         ext_val = (
@@ -691,7 +684,11 @@ def enrich_delivered_rows_with_callback_status(
         except ValueError:
             notified_at = None
 
-        extensions = _candidate_extensions(target_person)
+        extensions = {str(row["dahili"])} if row.get("dahili") else _candidate_extensions(target_person)
+        if not notified_at or not target_phone or not target_person:
+            row_copy["callback_status"] = "Kontrol Edilemedi (Eksik Kayıt)"
+            enriched.append(row_copy)
+            continue
         first_match: datetime | None = None
 
         for rec in prepared:
@@ -708,24 +705,10 @@ def enrich_delivered_rows_with_callback_status(
             by_extension = bool(ext and extensions and ext in extensions)
             by_name = _person_name_matches(ext_name, target_person)
             by_name_on_ext = _person_name_matches(ext, target_person)
-            personnel_match = by_extension or by_name or by_name_on_ext
+            personnel_match = by_extension if ext and extensions else by_name or by_name_on_ext
 
-            # Robust: check any string field in original rec for name match (in case name is in unexpected field)
-            if not personnel_match and "original" in rec:
-                orig = rec["original"]
-                for k, v in orig.items():
-                    if isinstance(v, (str, int)) and str(v).strip():
-                        if _person_name_matches(str(v), target_person):
-                            personnel_match = True
-                            break
-
-            # Telefon kontrolü: ya tam eşleşme ya da conv kaydında phone yoksa
             rec_phone = rec.get("phone") or ""
-            phone_match = (not target_phone) or (not rec_phone) or (rec_phone == target_phone)
-            # Extra robustness: if phones normalize to same last 9 digits (in case of prefix difference)
-            if not phone_match and target_phone and rec_phone:
-                if target_phone[-9:] == rec_phone[-9:]:
-                    phone_match = True
+            phone_match = bool(rec_phone and rec_phone == target_phone)
 
             if personnel_match and phone_match:
                 first_match = when

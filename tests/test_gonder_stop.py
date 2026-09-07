@@ -28,7 +28,18 @@ def test_gonder_control_cancel_when_idle(tmp_path):
     ctrl = GonderControl(tmp_path / "gonder_state.json")
     had, msg = ctrl.request_cancel()
     assert had is False
+    assert not ctrl.should_stop()
     assert "yok" in msg.casefold() or "sessiz" in msg.casefold()
+
+
+def test_gonder_control_restart_recovers_stale_job(tmp_path):
+    path = tmp_path / "gonder_state.json"
+    ctrl = GonderControl(path)
+    ctrl.begin([date(2026, 7, 20)])
+    restarted = GonderControl(path)
+    assert not restarted.is_running()
+    assert not restarted.should_stop()
+    assert restarted.active_dates() == [date(2026, 7, 20)]
 
 
 def test_gonder_control_cancel_when_running(tmp_path):
@@ -63,3 +74,6 @@ def test_phone_map_store_roundtrip(tmp_path):
     assert store2.lookup("905352211581") == "585"
     assert store2.merge({"905304605429": "622"}) == 1
     assert store2.lookup("905304605429") == "622"
+    store2.merge({"5352211581": "999"})
+    assert store2.lookup_manual("905352211581") == "585"
+    assert PhoneMapStore(tmp_path / "phone_map.json").lookup_manual("905352211581") == "585"

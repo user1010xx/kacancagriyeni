@@ -123,7 +123,7 @@ def test_should_mark_complete_rules():
 
     assert should_mark_complete(ctx_personnel, private_ok=True, group_ok=True)
     assert not should_mark_complete(ctx_personnel, private_ok=False, group_ok=True)
-    assert should_mark_complete(ctx_other, private_ok=False, group_ok=True)
+    assert not should_mark_complete(ctx_other, private_ok=False, group_ok=True)
 
 
 def test_private_chat_id():

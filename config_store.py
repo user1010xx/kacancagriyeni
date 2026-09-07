@@ -1,8 +1,11 @@
 import json
 import os
+import threading
+from copy import deepcopy
 from datetime import date
 from pathlib import Path
 from typing import Any
+from json_storage import load_json, save_json
 
 DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
     "company_code": "",
@@ -18,6 +21,7 @@ def _env_flag(name: str, *, default: bool = False) -> bool:
 class ConfigStore:
     def __init__(self, runtime_path: Path) -> None:
         self.runtime_path = runtime_path
+        self._lock = threading.RLock()
         self.runtime_path.parent.mkdir(parents=True, exist_ok=True)
         self._runtime = self._load_runtime()
         self._load_env()
@@ -70,35 +74,24 @@ class ConfigStore:
         )
         # Toniva kuyruk adları "1000" / "1000 (1000)" gelebiliyor.
         # Alias filtresi toniva_client içinde zaten var; loose ek güvenlik ağı.
-        # Explicit env yoksa: toniva→true, invekto→false
+        # Explicit env yoksa iki sağlayıcıda da tam eşleşme kullanılır.
         if "INVEKTO_DEPARTMENT_LOOSE_MATCH" in os.environ:
             self.department_loose_match = _env_flag(
                 "INVEKTO_DEPARTMENT_LOOSE_MATCH",
                 default=False,
             )
         else:
-            self.department_loose_match = self.pbx_provider == "toniva"
+            self.department_loose_match = False
 
     def _load_runtime(self) -> dict[str, Any]:
-        if not self.runtime_path.exists():
-            return DEFAULT_RUNTIME_CONFIG.copy()
-
-        try:
-            with self.runtime_path.open("r", encoding="utf-8") as file:
-                loaded = json.load(file)
-        except (OSError, json.JSONDecodeError, TypeError, ValueError):
-            return DEFAULT_RUNTIME_CONFIG.copy()
-
-        merged = DEFAULT_RUNTIME_CONFIG.copy()
+        loaded = load_json(self.runtime_path, {}, dict)
+        merged = deepcopy(DEFAULT_RUNTIME_CONFIG)
         if isinstance(loaded, dict):
             merged.update(loaded)
         return merged
 
     def _save_runtime(self) -> None:
-        temp_path = self.runtime_path.with_suffix(".tmp")
-        with temp_path.open("w", encoding="utf-8") as file:
-            json.dump(self._runtime, file, ensure_ascii=False, indent=2)
-        os.replace(temp_path, self.runtime_path)
+        save_json(self.runtime_path, self._runtime)
 
     @staticmethod
     def _read_chat_id() -> tuple[int, str | None]:
@@ -114,10 +107,24 @@ class ConfigStore:
     def company_code(self) -> str:
         return str(self._runtime.get("company_code", "")).strip()
 
+    @property
+    def last_poll_date(self) -> date | None:
+        try:
+            return date.fromisoformat(self._runtime.get("last_poll_date", ""))
+        except (ValueError, TypeError):
+            return None
+
+    @last_poll_date.setter
+    def last_poll_date(self, value: date) -> None:
+        with self._lock:
+            self._runtime["last_poll_date"] = value.isoformat()
+            self._save_runtime()
+
     @company_code.setter
     def company_code(self, value: str) -> None:
-        self._runtime["company_code"] = value.strip()
-        self._save_runtime()
+        with self._lock:
+            self._runtime["company_code"] = value.strip()
+            self._save_runtime()
 
     @property
     def is_toniva(self) -> bool:
@@ -149,12 +156,13 @@ class ConfigStore:
         return isinstance(stored, list) and key in stored
 
     def mark_backfilled(self, target: date, after_time: str | None = None) -> None:
-        stored = list(self._runtime.get("backfilled_dates", []))
-        key = self.backfill_job_key(target, after_time)
-        if key not in stored:
-            stored.append(key)
-            self._runtime["backfilled_dates"] = stored
-            self._save_runtime()
+        with self._lock:
+            stored = list(self._runtime.get("backfilled_dates", []))
+            key = self.backfill_job_key(target, after_time)
+            if key not in stored:
+                stored.append(key)
+                self._runtime["backfilled_dates"] = stored
+                self._save_runtime()
 
     def validate(self) -> list[str]:
         errors: list[str] = []
@@ -181,11 +189,7 @@ class ConfigStore:
         provider_label = "Toniva" if self.is_toniva else "Invekto"
 
         if self.is_toniva:
-            key_preview = (
-                f"{self.toniva_api_key[:8]}…"
-                if len(self.toniva_api_key) > 8
-                else ("ayarlı" if self.toniva_api_key else "yok")
-            )
+            key_preview = "ayarlı" if self.toniva_api_key else "yok"
             auth_line = f"🔑 API Key: {key_preview}\n"
             extra = (
                 f"📡 Base URL: {self.toniva_base_url}\n"
