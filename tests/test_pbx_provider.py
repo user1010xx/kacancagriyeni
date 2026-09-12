@@ -23,3 +23,16 @@ def test_provider_invekto_flag():
     with patch.dict(os.environ, {"PBX_PROVIDER": "invekto"}, clear=False):
         assert is_invekto()
         assert not is_toniva()
+
+
+def test_routing_fetch_includes_unanswered_outbound_calls():
+    from datetime import date
+    from pbx_provider import fetch_routing_conversations
+
+    day = date(2026, 9, 12)
+    for provider in ("toniva", "invekto"):
+        with patch.dict(os.environ, {"PBX_PROVIDER": provider}):
+            with patch(f"pbx_provider.{provider}_client.fetch_conversations", return_value=[]) as fetch:
+                assert fetch_routing_conversations("test", day, day) == []
+                expected = {"include_zero_duration": True, "force_day_chunk": True} if provider == "toniva" else {}
+                fetch.assert_called_once_with("test", day, day, **expected)

@@ -37,6 +37,7 @@ from pbx_provider import (
     dedupe_calls_by_key,
     enrich_delivered_rows_with_callback_status,
     fetch_conversations,
+    fetch_routing_conversations,
     fetch_missed_calls,
     get_available_queues,
     parse_command_date_list,
@@ -46,6 +47,8 @@ from pbx_provider import (
 from notifications import (
     NotifyKind,
     build_missed_call_context,
+    build_outbound_history,
+    lookup_outbound_before_call,
     counts_as_failed_dm,
     deliver_missed_call_notification,
     lookup_dahili_from_cache,
@@ -1030,8 +1033,8 @@ async def eslestir_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "Kullanım: /eslestir <telefon> <dahili_no_veya_ad>\n"
             "Örnek: /eslestir 905352211581 585\n"
             "Örnek: /eslestir 905352211581 selen\n\n"
-            "Bu kayıt kalıcıdır (phone_map.json). UI CDR'da görünen ama "
-            "API'den gelmeyen dış aramalar için kullanın."
+            "Bu kayıt yalnızca referans olarak saklanır. Otomatik yönlendirme "
+            "kaçan çağrıdan önceki doğrulanmış dış aramayı kullanır."
         )
         return
 
@@ -1056,7 +1059,7 @@ async def eslestir_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text(
             f"✅ Eşleme kaydedildi\n"
             f"📞 {phone} → {dahili} ({ad})\n"
-            f"Personel kaydı bulundu; sonraki kaçan çağrılarda DM+grup gidecek."
+            "Bu kayıt otomatik yönlendirmeyi değiştirmez; çağrı öncesi dış arama esas alınır."
         )
     else:
         await update.message.reply_text(
@@ -1067,31 +1070,30 @@ async def eslestir_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def debugeslesme_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Telefon eşleme teşhisi: cache, kalıcı map, API satır özeti."""
-    if not context.args:
-        await update.message.reply_text("Kullanım: /debugeslesme 905352211581")
+    """Belirtilen çağrı anı için gerçek yönlendirme kuralını salt okunur uygular."""
+    if len(context.args) not in (1, 3):
+        await update.message.reply_text("Kullanım: /debugeslesme <telefon> [gg.aa.yyyy ss:dd:ss]")
         return
 
     phone = context.args[0].strip()
     pk = normalize_phone_key(phone)
-    mem = lookup_dahili_from_cache(_dahili_cache, phone)
-    persistent = phone_map_store.lookup(phone)
-    personnel_mem = (
-        personnel_store.find_for_extension(mem) if mem else None
-    )
-    personnel_pers = (
-        personnel_store.find_for_extension(persistent) if persistent else None
-    )
-
+    try:
+        when = (dtm.strptime(" ".join(context.args[1:]), "%d.%m.%Y %H:%M:%S")
+                if len(context.args) == 3 else dtm.now(REPORT_TZ).replace(tzinfo=None))
+        if len(pk) != 10:
+            raise ValueError("phone")
+    except ValueError:
+        await update.message.reply_text("Geçersiz telefon/tarih. Örnek: /debugeslesme 905309644795 12.09.2026 13:53:42")
+        return
     lines = [
-        "🔎 Eşleme teşhisi\n",
+        "Eşleme teşhisi\n",
         f"Telefon: {phone}",
-        f"Normalize: {pk or '(boş)'}",
-        f"Bellek cache: {mem or 'YOK'} (cache boyutu={len(_dahili_cache)})",
-        f"Kalıcı map: {persistent or 'YOK'} (map boyutu={phone_map_store.count()})",
-        f"Personel(bellek): {personnel_mem.get('personel_adi') if personnel_mem else 'YOK'}",
-        f"Personel(kalıcı): {personnel_pers.get('personel_adi') if personnel_pers else 'YOK'}",
+        f"Esas alınan çağrı anı: {when:%d.%m.%Y %H:%M:%S}",
+        "Kural: Bu andan önceki son 15 günde son dış arama.",
+        "Eski cache ve kalıcı eşlemeler yönlendirmede kullanılmaz.",
     ]
+    if len(context.args) == 1:
+        lines.append("Çağrı zamanı belirtilmedi; sorgu anı kullanıldı, geçmiş bildirimi açıklamaz.")
 
     company_code = _require_company_code()
     if not company_code:
@@ -1099,41 +1101,27 @@ async def debugeslesme_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("\n".join(lines))
         return
 
-    await update.message.reply_text("API sorgulanıyor (son 3 gün)...")
+    await update.message.reply_text("Çağrı öncesi dış arama geçmişi sorgulanıyor...")
     try:
-        end = _report_today()
-        start = end - timedelta(days=3)
-        rows = await asyncio.to_thread(fetch_conversations, company_code, start, end)
-        hits = [
-            r
-            for r in rows
-            if normalize_phone_key(str(r.get("Phone") or r.get("phone") or "")) == pk
-        ]
-        lines.append(f"\nAPI conversations ({start}…{end}): {len(rows)} satır")
-        lines.append(f"Bu telefon eşleşen: {len(hits)}")
-        if hits:
-            sample = hits[-1]
-            lines.append(
-                f"Son kayıt: Ext={sample.get('Extension')!r} "
-                f"Name={sample.get('ExtensionName')!r} "
-                f"Date={sample.get('Date') or sample.get('ChekInDate')!r} "
-                f"Time={sample.get('Time') or sample.get('ChekInTime')!r}"
-            )
-        elif rows:
-            sample = rows[0]
-            lines.append(f"Örnek satır alanları: {list(sample.keys())[:15]}")
+        rows = await asyncio.to_thread(
+            fetch_routing_conversations, company_code, when.date() - timedelta(days=15), when.date(),
+        )
+        history = build_outbound_history(rows)
+        call = {"Phone": phone, "ChekInDate": when.date().isoformat(), "ChekInTime": when.strftime("%H:%M:%S")}
+        extension = lookup_outbound_before_call(call, history)
+        personnel = personnel_store.find_for_extension(extension) if extension else None
+        lines.append(f"Seçilen dahili: {extension or 'YOK / BELİRSİZ'}")
+        lines.append(f"Personel: {personnel.get('personel_adi') if personnel else 'YOK'}")
+        prior = [(stamp, ext) for stamp, ext in history.get(pk, [])
+                 if when - timedelta(days=15) <= stamp < when]
+        if prior:
+            stamp, selected = prior[-1]
+            lines.append(f"Son uygun dış arama: {stamp:%d.%m.%Y %H:%M:%S}, dahili={selected or 'BELİRSİZ'}")
         else:
-            lines.append(
-                "⚠️ API 0 satır döndü — UI CDR public API'de yok olabilir. "
-                "Manuel: /eslestir <tel> <dahili>"
-            )
+            lines.append("Doğrulanmış önceki dış arama yok; otomatik DM gönderilmez.")
     except Exception as exc:
-        lines.append(f"\nAPI hata: {exc}")
-
-    lines.append(
-        "\nManuel eşle: /eslestir "
-        f"{phone} <dahili>"
-    )
+        logger.warning("Eşleme teşhis sorgusu başarısız: %s", exc)
+        lines.append("API sorgusu başarısız; alıcı doğrulanamadı.")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -1280,24 +1268,17 @@ async def _process_missed_calls_for_date(
         if cutoff:
             calls = _apply_time_cutoff(calls, target_date, cutoff, delivery_state=state)
 
-        global _dahili_cache, _dahili_cache_built_at
-        now_mono = dtm.now()
-        if (
-            _dahili_cache_built_at is None
-            or (now_mono - _dahili_cache_built_at).total_seconds() > _DAHILI_CACHE_TTL_SECONDS
-        ):
-            if should_cancel and should_cancel():
-                return 0, 0
-            _dahili_cache = await asyncio.to_thread(build_phone_dahili_cache, company_code, 15)
-            _dahili_cache_built_at = now_mono
-            # API'den gelen eşlemeleri kalıcı depoya yaz
-            try:
-                merged = phone_map_store.merge(_dahili_cache)
-                if merged:
-                    logger.info("phone_map kalıcı depo güncellendi: +%s kayıt", merged)
-            except Exception as exc:
-                logger.warning("phone_map merge başarısız: %s", exc)
-        dahili_cache = _dahili_cache
+        calls = [call for call in calls if not state.is_complete_any(call_key_variants(call))]
+        if not calls or (should_cancel and should_cancel()):
+            return 0, 0
+        try:
+            conversations = await asyncio.to_thread(
+                fetch_routing_conversations, company_code,
+                target_date - timedelta(days=15), target_date,
+            )
+            outbound_history = build_outbound_history(conversations)
+        except Exception as exc:
+            raise PbxError("Yönlendirme için dış arama geçmişi alınamadı") from exc
 
         for call in calls:
             if should_cancel and should_cancel():
@@ -1310,10 +1291,11 @@ async def _process_missed_calls_for_date(
 
             notify_ctx = build_missed_call_context(
                 call,
-                dahili_cache=dahili_cache,
+                dahili_cache={},
                 personnel_store=personnel_store,
                 sent_store=state,
                 phone_map_store=phone_map_store,
+                outbound_history=outbound_history,
             )
             if notify_ctx is None:
                 continue

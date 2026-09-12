@@ -1,3 +1,5 @@
+import pytest
+
 from notifications import (
     NotifyKind,
     build_group_text,
@@ -30,6 +32,96 @@ class _FakeSentStore:
 
     def is_private_notified_any(self, keys: list[str]) -> bool:
         return any(key in self.private_notified for key in keys)
+
+
+def test_routing_uses_outbound_before_missed_call_not_later_callback(tmp_path):
+    from notifications import build_outbound_history
+    from phone_map_store import PhoneMapStore
+
+    personnel = PersonnelStore(tmp_path / "people.json")
+    personnel.add_or_update("657", "Mahmut", "mahmut")
+    personnel.add_or_update("646", "Elisa", "elisa")
+    mapping = PhoneMapStore(tmp_path / "map.json")
+    mapping.set("905309644795", "646")
+    history = build_outbound_history([
+        {"Phone": "905309644795", "Extension": "646", "Direction": "outbound",
+         "Date": "12.09.2026", "Time": "14:05:00"},
+        {"Phone": "905309644795", "Extension": "657", "Direction": "outbound",
+         "Date": "12.09.2026", "Time": "13:47:07", "Duration": 0},
+        {"Phone": "905309644795", "Extension": "646", "Direction": "inbound",
+         "Date": "12.09.2026", "Time": "13:50:00"},
+    ])
+    call = {"Phone": "905309644795", "ChekInDate": "2026-09-12",
+            "ChekInTime": "13:53:42", "Queue": "1000"}
+    ctx = build_missed_call_context(
+        call, dahili_cache={"5309644795": "646"}, personnel_store=personnel,
+        sent_store=_FakeSentStore(), phone_map_store=mapping, outbound_history=history,
+    )
+    assert ctx.dahili == "657"
+    assert ctx.personnel["personel_adi"] == "Mahmut"
+
+
+def test_routing_without_prior_outbound_does_not_use_stale_mapping(tmp_path):
+    from notifications import build_outbound_history
+    from phone_map_store import PhoneMapStore
+
+    personnel = PersonnelStore(tmp_path / "people.json")
+    personnel.add_or_update("646", "Elisa", "elisa")
+    mapping = PhoneMapStore(tmp_path / "map.json")
+    mapping.set("905309644795", "646")
+    call = {"Phone": "905309644795", "ChekInDate": "2026-09-12",
+            "ChekInTime": "13:53:42", "Queue": "1000"}
+    ctx = build_missed_call_context(
+        call, dahili_cache={"5309644795": "646"}, personnel_store=personnel,
+        sent_store=_FakeSentStore(), phone_map_store=mapping,
+        outbound_history=build_outbound_history([]),
+    )
+    assert ctx.kind == NotifyKind.NO_DAHILI
+    assert ctx.personnel is None
+
+
+@pytest.mark.parametrize("changes", [
+    {"Time": "13:53:42"},
+    {"Time": "14:00:00"},
+    {"Date": "27.08.2026"},
+    {"Date": "invalid"},
+    {"Direction": "inbound"},
+    {"Direction": ""},
+    {"Phone": "905309644794"},
+    {"Extension": "905309644795"},
+])
+def test_routing_rejects_unverified_or_out_of_window_records(changes):
+    from notifications import build_outbound_history, lookup_outbound_before_call
+
+    row = {"Phone": "905309644795", "Extension": "657", "Direction": "outbound",
+           "Date": "12.09.2026", "Time": "13:47:07"}
+    row.update(changes)
+    call = {"Phone": "905309644795", "ChekInDate": "2026-09-12", "ChekInTime": "13:53:42"}
+    assert lookup_outbound_before_call(call, build_outbound_history([row])) is None
+
+
+def test_routing_conflicting_extensions_at_same_time_are_ambiguous():
+    from notifications import build_outbound_history, lookup_outbound_before_call
+
+    row = {"Phone": "905309644795", "Extension": "657", "Direction": "outbound",
+           "Date": "12.09.2026", "Time": "13:47:07"}
+    call = {"Phone": row["Phone"], "ChekInDate": row["Date"], "ChekInTime": "13:53:42"}
+    assert lookup_outbound_before_call(call, build_outbound_history([row, row])) == "657"
+    assert lookup_outbound_before_call(call, build_outbound_history([
+        row, {**row, "Extension": "646"},
+    ])) is None
+
+
+def test_routing_each_missed_call_uses_its_own_time():
+    from notifications import build_outbound_history, lookup_outbound_before_call
+
+    row = {"Phone": "905309644795", "Extension": "657", "Direction": "outbound",
+           "Date": "12.09.2026", "Time": "13:47:07"}
+    history = build_outbound_history([row, {**row, "Extension": "646", "Time": "14:05:00"}])
+    call = {"Phone": row["Phone"], "ChekInDate": row["Date"], "ChekInTime": "13:53:42"}
+    assert lookup_outbound_before_call(call, history) == "657"
+    assert lookup_outbound_before_call({**call, "ChekInTime": "14:10:00"}, history) == "646"
+    assert lookup_outbound_before_call({**call, "ChekInTime": "invalid"}, history) is None
 
 
 def test_build_private_text_format():

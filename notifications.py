@@ -1,4 +1,5 @@
 import logging
+from bisect import bisect_left
 from dataclasses import dataclass
 from datetime import datetime as dtm
 from enum import Enum
@@ -8,7 +9,45 @@ import os
 from datetime import timedelta
 from telegram.error import RetryAfter
 
-from invekto_client import _call_datetime, _normalize_phone, call_key, call_key_variants
+from invekto_client import (
+    _call_datetime, _normalize_phone, _extract_dahili_from_record,
+    _parse_conversation_datetime, is_outbound_conversation, call_key, call_key_variants,
+)
+
+
+def build_outbound_history(records: list[dict[str, Any]]) -> dict[str, list[tuple[dtm, str | None]]]:
+    grouped: dict[str, dict[dtm, set[str]]] = {}
+    for record in records:
+        if not is_outbound_conversation(record):
+            continue
+        phone = _normalize_phone(record.get("Phone") or record.get("phone") or "")
+        extension = _extract_dahili_from_record(record)
+        when = _parse_conversation_datetime(
+            record.get("Date") or record.get("ChekInDate") or record.get("CreateDate"),
+            record.get("Time") or record.get("ChekInTime") or record.get("CreateTime"),
+        )
+        if len(phone) != 10 or not extension or when == dtm.min:
+            continue
+        if sum(char.isdigit() for char in extension) >= 10:
+            continue
+        grouped.setdefault(phone, {}).setdefault(when, set()).add(extension)
+    return {
+        phone: [(when, next(iter(extensions)) if len(extensions) == 1 else None)
+                for when, extensions in sorted(hits.items())]
+        for phone, hits in grouped.items()
+    }
+
+
+def lookup_outbound_before_call(call: dict[str, Any], history: dict) -> str | None:
+    call_date, call_time = _call_datetime(call)
+    when = _parse_conversation_datetime(call_date, call_time)
+    if when == dtm.min:
+        return None
+    hits = history.get(_normalize_phone(call.get("Phone") or ""), [])
+    index = bisect_left(hits, when, key=lambda hit: hit[0]) - 1
+    if index < 0 or hits[index][0] < when - timedelta(days=15):
+        return None
+    return hits[index][1]
 
 
 def lookup_dahili_from_cache(dahili_cache: dict, phone: str) -> str | None:
@@ -73,6 +112,7 @@ def build_missed_call_context(
     personnel_store,
     sent_store,
     phone_map_store=None,
+    outbound_history: dict | None = None,
 ) -> MissedCallContext | None:
     key = call_key(call)
     key_variants = call_key_variants(call)
@@ -88,14 +128,16 @@ def build_missed_call_context(
     phone = str(call.get("Phone") or "")
     call_time_str = build_call_time_str(call)
 
-    # 1) bellek cache  2) kalıcı phone_map  3) yoksa NO_DAHILI
-    dahili = phone_map_store.lookup_manual(phone) if phone_map_store is not None else None
-    dahili = dahili or lookup_dahili_from_cache(dahili_cache, phone)
-    if not dahili and phone_map_store is not None:
-        try:
-            dahili = phone_map_store.lookup(phone)
-        except Exception:
-            dahili = None
+    if outbound_history is not None:
+        dahili = lookup_outbound_before_call(call, outbound_history)
+    else:
+        dahili = phone_map_store.lookup_manual(phone) if phone_map_store is not None else None
+        dahili = dahili or lookup_dahili_from_cache(dahili_cache, phone)
+        if not dahili and phone_map_store is not None:
+            try:
+                dahili = phone_map_store.lookup(phone)
+            except Exception:
+                dahili = None
 
     if not dahili:
         return MissedCallContext(

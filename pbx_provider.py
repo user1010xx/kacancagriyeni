@@ -79,6 +79,13 @@ def fetch_conversations(
         raise PbxError(str(exc)) from exc
 
 
+def fetch_routing_conversations(
+    company_code: str, start_date: date, end_date: date,
+) -> list[dict[str, Any]]:
+    kwargs = {"include_zero_duration": True, "force_day_chunk": True} if is_toniva() else {}
+    return fetch_conversations(company_code, start_date, end_date, **kwargs)
+
+
 def get_available_queues(
     company_code: str,
     start_date: date,

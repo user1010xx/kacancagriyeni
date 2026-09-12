@@ -34,6 +34,10 @@ def delivery(monkeypatch, tmp_path):
     monkeypatch.setattr(app, "_fetch_kwargs", lambda: {})
     monkeypatch.setattr(app, "_cutoff_time_for_date", lambda target: None)
     monkeypatch.setattr(app, "fetch_missed_calls", lambda *args, **kwargs: [call])
+    monkeypatch.setattr(app, "fetch_routing_conversations", lambda *args: [
+        {"Phone": call["Phone"], "Extension": "105", "Direction": "outbound",
+         "Date": call["ChekInDate"], "Time": "11:00:00"},
+    ])
     monkeypatch.setattr(app, "build_phone_dahili_cache", lambda *args: {})
     monkeypatch.setattr(app, "_dahili_cache", {})
     monkeypatch.setattr(app, "_dahili_cache_built_at", datetime.now())
@@ -41,7 +45,7 @@ def delivery(monkeypatch, tmp_path):
     return today, call, SimpleNamespace(send_message=AsyncMock())
 
 
-def test_unmatched_call_retries_after_mapping_and_reload(delivery, monkeypatch):
+def test_unmatched_call_retries_after_personnel_and_reload(delivery, monkeypatch):
     today, call, telegram = delivery
     asyncio.run(app._process_missed_calls_for_date(telegram, today))
     assert len(app.sent_store.pending_calls(today)) == 1
@@ -80,6 +84,72 @@ def test_failed_dm_not_reported(delivery):
     assert asyncio.run(app._process_missed_calls_for_date(telegram, today)) == (0, 1)
     assert app.delivered_store.get_by_call_date(today) == []
     assert app.sent_store.pending_calls(today)
+
+
+def test_wrong_recipient_incident_routes_to_mahmut(delivery, monkeypatch):
+    today, call, telegram = delivery
+    call.update(Phone="905309644795", ChekInTime="13:53:42")
+    app.phone_map_store.set(call["Phone"], "646")
+    app.personnel_store.add_or_update("657", "Mahmut", "mahmut", telegram_chat_id="65700")
+    app.personnel_store.add_or_update("646", "Elisa", "elisa", telegram_chat_id="64600")
+    monkeypatch.setattr(app, "_dahili_cache", {"5309644795": "646"})
+    rows = [
+        {"Phone": call["Phone"], "Extension": extension, "Direction": direction,
+         "Date": today.isoformat(), "Time": when, "Duration": 0}
+        for extension, direction, when in [
+            ("646", "outbound", "14:05:00"),
+            ("646", "inbound", "13:53:42"),
+            ("657", "outbound", "13:47:07"),
+        ]
+    ]
+    from unittest.mock import Mock
+    fetch = Mock(return_value=rows)
+    monkeypatch.setattr(app, "fetch_routing_conversations", fetch)
+    asyncio.run(app._process_missed_calls_for_date(telegram, today))
+    assert fetch.call_args.args == ("test", today - timedelta(days=15), today)
+    assert telegram.send_message.call_args_list[0].kwargs["chat_id"] == 65700
+    assert all(item.kwargs["chat_id"] != 64600 for item in telegram.send_message.call_args_list)
+    assert app.delivered_store.get_by_call_date(today)[0]["dahili"] == "657"
+    asyncio.run(app._process_missed_calls_for_date(telegram, today))
+    assert telegram.send_message.await_count == 2
+    assert fetch.call_count == 1
+
+
+def test_routing_api_failure_keeps_pending_without_sending(delivery, monkeypatch):
+    today, call, telegram = delivery
+    app.phone_map_store.set(call["Phone"], "105")
+    app.personnel_store.add_or_update("105", "Ali", "ali", telegram_chat_id="123")
+    from unittest.mock import Mock
+    monkeypatch.setattr(app, "fetch_routing_conversations", Mock(side_effect=app.PbxError("offline")))
+    with pytest.raises(app.PbxError):
+        asyncio.run(app._process_missed_calls_for_date(telegram, today))
+    telegram.send_message.assert_not_awaited()
+    assert app.sent_store.pending_calls(today)
+    assert app.delivered_store.get_by_call_date(today) == []
+
+
+def test_debug_routing_uses_requested_call_time_without_mutation(delivery, monkeypatch):
+    today, call, telegram = delivery
+    app.personnel_store.add_or_update("657", "Mahmut", "mahmut", telegram_chat_id="65700")
+    app.phone_map_store.set("905309644795", "646")
+    row = {"Phone": "905309644795", "Extension": "657", "Direction": "outbound",
+           "Date": "12.09.2026", "Time": "13:47:07"}
+    from unittest.mock import Mock
+    fetch = Mock(return_value=[row, {**row, "Extension": "646", "Time": "14:05:00"}])
+    monkeypatch.setattr(app, "fetch_routing_conversations", fetch)
+    reply = AsyncMock()
+    update = SimpleNamespace(message=SimpleNamespace(reply_text=reply))
+    context = SimpleNamespace(args=[row["Phone"], "12.09.2026", "13:53:42"])
+    asyncio.run(app.debugeslesme_command(update, context))
+    result = reply.call_args.args[0]
+    assert "Mahmut" in result
+    assert "657" in result
+    assert "13:47:07" in result
+    assert "14:05:00" not in result
+    assert fetch.call_args.args[1:] == (datetime(2026, 8, 28).date(), datetime(2026, 9, 12).date())
+    assert app.phone_map_store.lookup(row["Phone"]) == "646"
+    assert app.sent_store.pending_calls(today) == []
+    telegram.send_message.assert_not_awaited()
 
 
 def test_poll_retains_error_when_later_day_succeeds(delivery, monkeypatch):

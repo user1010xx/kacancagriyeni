@@ -90,7 +90,17 @@ Bot aynı kaynağı kullanır:
 
 1. `GET /reports/queue-detail?startDate=...&endDate=...&queue=1000`
 2. Satırlarda status **Cevapsız** (env: `TONIVA_MISSED_STATUS`)
-3. Personel eşlemesi için `GET /reports/conversations` (telefon → son dahili, 15 gün cache)
+3. Personel eşlemesi için `GET /reports/conversations`: her kaçan çağrının kendi
+     saatinden **önceki son 15 günde, aynı numaraya yapılan son dış arama** kullanılır.
+     Cevaplanmamış/sıfır süreli dış aramalar dahildir. Sonraki aramalar, gelen aramalar
+     ve kuyruk kayıtları alıcıyı değiştirmez. Aynı saniyede farklı dahili varsa seçim
+     belirsizdir. Geçersiz tarih, bilinmeyen yön veya önceki dış arama yoksa DM gönderilmez;
+     çağrı beklemede kalır. PBX sorgusu başarısızsa eski eşlemeye geri dönülmez.
+
+Telefonun zaman bilgisi olmayan eski bellek/kalıcı/manuel eşlemeleri otomatik
+yönlendirmede kullanılmaz; mevcut dosyalar silinmez. Her bekleyen çağrı grubu için
+tarih aralığı yeniden sorgulanır; 5 dakikalık eski alıcı cache'i kullanılmaz.
+Tamamlanmış bildirimler bu değişiklikle yeniden gönderilmez ve geçmiş kayıtlar değiştirilmez.
 
 ## Komutlar (Sadece yetkili grupta)
 
@@ -108,13 +118,16 @@ Bot aynı kaynağı kullanır:
 | `/gonder 20.07.2026,21.07.2026` | Seçili günleri gruba+DM yeniden ilet (arka plan) |
 | `/gonder durdur` | Devam eden gönderim kaydedildikten sonra işi durdur |
 | `/gonder sessiz` | Kalan dedup’u bildirimsiz kapat (flood acil kes) |
-| `/eslestir 9053… 585` | Telefon→dahili kalıcı eşleme (API CDR eksikse) |
-| `/debugeslesme 9053…` | Eşleme teşhisi (cache + API) |
+| `/eslestir 9053… 585` | Yalnızca referans eşleme kaydı; otomatik alıcıyı değiştirmez |
+| `/debugeslesme 9053… 12.09.2026 13:53:42` | Belirtilen çağrı anına göre salt okunur yönlendirme teşhisi |
 | `/personelekle` `/personelsil` `/personeller` | Personel yönetimi |
 | `/temizle` | Eski dedup kayıtlarını temizle |
 | Excel (.xlsx) yükle | Toplu personel: A=isim, B=dahili, C=@username |
 
 **DM için:** Personel bota özel sohbetten `/start` yazmalıdır.
+
+`/debugeslesme` tarih/saat verilmeden kullanılırsa sorgu anını esas alır; geçmişteki
+bir bildirimi incelemek için kaçan çağrının tarih ve saatini mutlaka belirtin.
 
 Yönetim komutları (`/firmakodu`, `/temizle`, `/gonder`, `/eslestir`,
 `/debugeslesme`, personel komutları ve Excel yükleme) yalnızca tanımlı grubun
