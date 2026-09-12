@@ -1120,7 +1120,7 @@ async def debugeslesme_command(update: Update, context: ContextTypes.DEFAULT_TYP
         else:
             lines.append("Doğrulanmış önceki dış arama yok; otomatik DM gönderilmez.")
     except Exception as exc:
-        logger.warning("Eşleme teşhis sorgusu başarısız: %s", exc)
+        logger.exception("Eşleme teşhis sorgusu başarısız (%s)", type(exc).__name__)
         lines.append("API sorgusu başarısız; alıcı doğrulanamadı.")
     await update.message.reply_text("\n".join(lines))
 
@@ -1278,6 +1278,7 @@ async def _process_missed_calls_for_date(
             )
             outbound_history = build_outbound_history(conversations)
         except Exception as exc:
+            logger.exception("Yönlendirme geçmişi alınamadı (%s)", target_date.isoformat())
             raise PbxError("Yönlendirme için dış arama geçmişi alınamadı") from exc
 
         for call in calls:

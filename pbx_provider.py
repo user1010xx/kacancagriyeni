@@ -6,7 +6,12 @@ Bot ve diğer katmanlar bu modülden import eder; provider env ile değişir.
 from __future__ import annotations
 
 import os
-from datetime import date
+import hashlib
+import threading
+import time
+from collections import OrderedDict
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Any
 
 import invekto_client
@@ -29,6 +34,15 @@ from invekto_client import (  # noqa: F401
 
 class PbxError(Exception):
     """Birleşik PBX hata tipi (InvektoError / TonivaError sarmalayıcı)."""
+
+
+_ROUTING_CACHE_LOCK = threading.Lock()
+_ROUTING_DAY_CACHE: OrderedDict[tuple, tuple[float, list[dict[str, Any]]]] = OrderedDict()
+_ROUTING_CACHE_MAX_DAYS = 64
+
+
+def _routing_today() -> date:
+    return datetime.now(ZoneInfo(os.getenv("BOT_TIMEZONE", "Europe/Istanbul"))).date()
 
 
 def get_provider_name() -> str:
@@ -83,7 +97,33 @@ def fetch_routing_conversations(
     company_code: str, start_date: date, end_date: date,
 ) -> list[dict[str, Any]]:
     kwargs = {"include_zero_duration": True, "force_day_chunk": True} if is_toniva() else {}
-    return fetch_conversations(company_code, start_date, end_date, **kwargs)
+    if end_date < start_date:
+        start_date, end_date = end_date, start_date
+    identity = (
+        get_provider_name(), company_code,
+        os.getenv("TONIVA_BASE_URL", ""),
+        hashlib.sha256(os.getenv("TONIVA_API_KEY", "").encode()).hexdigest(),
+        os.getenv("BOT_TIMEZONE", "Europe/Istanbul"),
+    )
+    result: list[dict[str, Any]] = []
+    day = start_date
+    while day <= end_date:
+        key = (*identity, day)
+        with _ROUTING_CACHE_LOCK:
+            now = time.monotonic()
+            ttl = 15 if day >= _routing_today() else 3600
+            cached = _ROUTING_DAY_CACHE.get(key)
+            if cached is None or now - cached[0] >= ttl:
+                rows = fetch_conversations(company_code, day, day, **kwargs)
+                _ROUTING_DAY_CACHE[key] = (time.monotonic(), rows)
+            else:
+                rows = cached[1]
+            _ROUTING_DAY_CACHE.move_to_end(key)
+            while len(_ROUTING_DAY_CACHE) > _ROUTING_CACHE_MAX_DAYS:
+                _ROUTING_DAY_CACHE.popitem(last=False)
+            result.extend(dict(row) for row in rows)
+        day += timedelta(days=1)
+    return result
 
 
 def get_available_queues(

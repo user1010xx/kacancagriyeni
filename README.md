@@ -98,8 +98,13 @@ Bot aynı kaynağı kullanır:
      çağrı beklemede kalır. PBX sorgusu başarısızsa eski eşlemeye geri dönülmez.
 
 Telefonun zaman bilgisi olmayan eski bellek/kalıcı/manuel eşlemeleri otomatik
-yönlendirmede kullanılmaz; mevcut dosyalar silinmez. Her bekleyen çağrı grubu için
-tarih aralığı yeniden sorgulanır; 5 dakikalık eski alıcı cache'i kullanılmaz.
+yönlendirmede kullanılmaz; mevcut dosyalar silinmez. Tarama ve teşhis, başarıyla
+alınmış günlük görüşme verisini süreç içinde paylaşır. Bugün/future günler 15 saniye,
+geçmiş günler 1 saat saklanır; en fazla 64 günlük cache girdisi tutulur. Eşzamanlı
+sorgular aynı günü tekrar çekmez. Başarısız yenilemede süresi dolmuş veriye dönülmez;
+başarılı günler sonraki denemede yeniden kullanılabilir. Yeniden başlatmada cache
+boşalır; ilk geçmiş yüklemesi hâlâ zaman alabilir. Alıcı her çağrının kendi saatine
+göre yeniden seçilir; 5 dakikalık eski alıcı cache'i kullanılmaz.
 Tamamlanmış bildirimler bu değişiklikle yeniden gönderilmez ve geçmiş kayıtlar değiştirilmez.
 
 ## Komutlar (Sadece yetkili grupta)
