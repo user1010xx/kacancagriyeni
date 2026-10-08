@@ -11,6 +11,7 @@ def isolated_routing_cache(monkeypatch):
     import pbx_provider as provider
 
     monkeypatch.setattr(provider, "_ROUTING_DAY_CACHE", OrderedDict())
+    monkeypatch.setattr(provider, "_ROUTING_DAY_INFLIGHT", {})
 
 
 def test_concurrent_routing_requests_share_daily_fetch():
@@ -31,6 +32,31 @@ def test_concurrent_routing_requests_share_daily_fetch():
             futures = [pool.submit(request) for _ in range(2)]
             assert futures[0].result(timeout=5) == futures[1].result(timeout=5)
         assert fetch.call_count == 1
+
+
+def test_routing_history_fetches_distinct_days_concurrently():
+    from datetime import date, timedelta
+    from threading import Barrier
+    import pbx_provider as provider
+
+    start = date(2026, 9, 10)
+    barrier = Barrier(3)
+
+    def fetch_day(company_code, day_start, day_end, **kwargs):
+        barrier.wait(timeout=5)
+        return [{"Date": day_start.isoformat()}]
+
+    with patch.object(provider, "fetch_conversations", side_effect=fetch_day) as fetch:
+        rows = provider.fetch_routing_conversations(
+            "parallel", start, start + timedelta(days=2)
+        )
+
+    assert [row["Date"] for row in rows] == [
+        "2026-09-10",
+        "2026-09-11",
+        "2026-09-12",
+    ]
+    assert fetch.call_count == 3
 
 
 def test_routing_refreshes_today_without_reloading_history(monkeypatch):

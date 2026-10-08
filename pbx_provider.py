@@ -9,6 +9,7 @@ import os
 import hashlib
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from collections import OrderedDict
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -40,7 +41,9 @@ _ROUTING_CACHE_LOCK = threading.Lock()
 _ROUTING_DAY_CACHE: OrderedDict[
     tuple, tuple[float, list[dict[str, Any]], date]
 ] = OrderedDict()
+_ROUTING_DAY_INFLIGHT: dict[tuple, Future[list[dict[str, Any]]]] = {}
 _ROUTING_CACHE_MAX_DAYS = 64
+_ROUTING_FETCH_WORKERS = 4
 
 
 def _routing_today() -> date:
@@ -107,9 +110,12 @@ def fetch_routing_conversations(
         hashlib.sha256(os.getenv("TONIVA_API_KEY", "").encode()).hexdigest(),
         os.getenv("BOT_TIMEZONE", "Europe/Istanbul"),
     )
-    result: list[dict[str, Any]] = []
-    day = start_date
-    while day <= end_date:
+    days = [
+        start_date + timedelta(days=offset)
+        for offset in range((end_date - start_date).days + 1)
+    ]
+
+    def fetch_day(day: date) -> list[dict[str, Any]]:
         key = (*identity, day)
         with _ROUTING_CACHE_LOCK:
             now = time.monotonic()
@@ -117,17 +123,49 @@ def fetch_routing_conversations(
             ttl = 15 if day >= today else 3600
             cached = _ROUTING_DAY_CACHE.get(key)
             crossed_midnight = cached is not None and cached[2] == day and today > day
-            if cached is None or crossed_midnight or now - cached[0] >= ttl:
-                rows = fetch_conversations(company_code, day, day, **kwargs)
-                _ROUTING_DAY_CACHE[key] = (time.monotonic(), rows, today)
+            if cached is not None and not crossed_midnight and now - cached[0] < ttl:
+                _ROUTING_DAY_CACHE.move_to_end(key)
+                return [dict(row) for row in cached[1]]
+
+            pending = _ROUTING_DAY_INFLIGHT.get(key)
+            if pending is None:
+                pending = Future()
+                _ROUTING_DAY_INFLIGHT[key] = pending
+                owns_fetch = True
             else:
-                rows = cached[1]
+                owns_fetch = False
+
+        if not owns_fetch:
+            return [dict(row) for row in pending.result()]
+
+        try:
+            rows = fetch_conversations(company_code, day, day, **kwargs)
+        except BaseException as exc:
+            with _ROUTING_CACHE_LOCK:
+                if _ROUTING_DAY_INFLIGHT.get(key) is pending:
+                    _ROUTING_DAY_INFLIGHT.pop(key)
+                pending.set_exception(exc)
+            raise
+
+        with _ROUTING_CACHE_LOCK:
+            _ROUTING_DAY_CACHE[key] = (time.monotonic(), rows, today)
             _ROUTING_DAY_CACHE.move_to_end(key)
             while len(_ROUTING_DAY_CACHE) > _ROUTING_CACHE_MAX_DAYS:
                 _ROUTING_DAY_CACHE.popitem(last=False)
-            result.extend(dict(row) for row in rows)
-        day += timedelta(days=1)
-    return result
+            if _ROUTING_DAY_INFLIGHT.get(key) is pending:
+                _ROUTING_DAY_INFLIGHT.pop(key)
+            pending.set_result(rows)
+        return [dict(row) for row in rows]
+
+    if len(days) == 1:
+        return fetch_day(days[0])
+
+    with ThreadPoolExecutor(max_workers=min(_ROUTING_FETCH_WORKERS, len(days))) as pool:
+        return [
+            row
+            for day_rows in pool.map(fetch_day, days)
+            for row in day_rows
+        ]
 
 
 def get_available_queues(
