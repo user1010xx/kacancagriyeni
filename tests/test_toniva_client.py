@@ -255,6 +255,150 @@ def test_normalize_outbound_zero_talk_cdr_seda():
     assert row["ExtensionName"] == "seda"
 
 
+def test_raw_toniva_utc_timestamps_route_incident_to_prior_caller(monkeypatch, tmp_path):
+    from unittest.mock import MagicMock
+
+    from notifications import build_missed_call_context, build_outbound_history
+    from personnel_store import PersonnelStore
+    from toniva_client import normalize_conversation_row, normalize_queue_detail_row
+
+    monkeypatch.setenv("BOT_TIMEZONE", "Europe/Istanbul")
+    history = build_outbound_history([
+        normalize_conversation_row({
+            "Phone": "905309644795",
+            "Extension": "657",
+            "Direction": "outbound",
+            "DateTime": "2026-09-12T10:47:07Z",
+        }),
+        normalize_conversation_row({
+            "Phone": "905309644795",
+            "Extension": "646",
+            "Direction": "outbound",
+            "DateTime": "2026-09-12T11:05:00Z",
+        }),
+    ])
+    missed = normalize_queue_detail_row({
+        "Phone": "905309644795",
+        "Queue": "1000",
+        "Status": "Cevapsız",
+        "DateTime": "2026-09-12T10:53:42Z",
+    })
+
+    assert missed["ChekInDate"] == "12.09.2026"
+    assert missed["ChekInTime"] == "13:53:42"
+    personnel = PersonnelStore(tmp_path / "personnel.json")
+    personnel.add_or_update("657", "Mahmut", "mahmut")
+    personnel.add_or_update("646", "Elisa", "elisa")
+    sent_store = MagicMock()
+    sent_store.is_complete_any.return_value = False
+    sent_store.is_group_notified_any.return_value = False
+    sent_store.is_private_notified_any.return_value = False
+
+    context = build_missed_call_context(
+        missed,
+        dahili_cache={"5309644795": "646"},
+        personnel_store=personnel,
+        sent_store=sent_store,
+        outbound_history=history,
+    )
+
+    assert context.dahili == "657"
+    assert context.personnel["personel_adi"] == "Mahmut"
+
+
+def test_space_separated_combined_datetime_is_split_for_routing():
+    from notifications import build_outbound_history, lookup_outbound_before_call
+    from toniva_client import normalize_conversation_row
+
+    prior = normalize_conversation_row({
+        "Phone": "905309644795",
+        "Extension": "657",
+        "Direction": "outbound",
+        "DateTime": "2026-09-12 13:47:07",
+    })
+    call = {
+        "Phone": "905309644795",
+        "ChekInDate": "2026-09-12",
+        "ChekInTime": "13:53:42",
+    }
+
+    assert prior["Date"] == "12.09.2026"
+    assert prior["Time"] == "13:47:07"
+    assert lookup_outbound_before_call(call, build_outbound_history([prior])) == "657"
+
+
+def test_turkish_date_without_time_does_not_become_invalid_time():
+    from toniva_client import normalize_conversation_row, normalize_queue_detail_row
+
+    conversation = normalize_conversation_row({
+        "Phone": "905309644795",
+        "Extension": "657",
+        "Direction": "outbound",
+        "Date": "Cumartesi 12 Eylül 2026",
+    })
+    missed = normalize_queue_detail_row({
+        "Phone": "905309644795",
+        "Queue": "1000",
+        "Status": "Cevapsız",
+        "Date": "Cumartesi 12 Eylül 2026",
+    })
+
+    assert conversation["Date"] == "12.09.2026"
+    assert conversation["Time"] == ""
+    assert missed["ChekInDate"] == "12.09.2026"
+    assert missed["ChekInTime"] == ""
+
+
+def test_combined_datetime_supplies_time_when_separate_date_also_exists():
+    from toniva_client import normalize_conversation_row, normalize_queue_detail_row
+
+    raw = {
+        "Phone": "905309644795",
+        "Date": "2026-09-12",
+        "DateTime": "2026-09-12 13:47:07",
+    }
+    conversation = normalize_conversation_row({
+        **raw,
+        "Extension": "657",
+        "Direction": "outbound",
+    })
+    missed = normalize_queue_detail_row({
+        **raw,
+        "Queue": "1000",
+        "Status": "Cevapsız",
+    })
+
+    assert conversation["Date"] == "12.09.2026"
+    assert conversation["Time"] == "13:47:07"
+    assert missed["ChekInDate"] == "12.09.2026"
+    assert missed["ChekInTime"] == "13:47:07"
+
+
+def test_utc_datetime_keeps_local_date_consistent_when_crossing_midnight():
+    from toniva_client import normalize_conversation_row, normalize_queue_detail_row
+
+    raw = {
+        "Phone": "905309644795",
+        "Date": "2026-10-08",
+        "DateTime": "2026-10-08T21:05:00Z",
+    }
+    conversation = normalize_conversation_row({
+        **raw,
+        "Extension": "657",
+        "Direction": "outbound",
+    })
+    missed = normalize_queue_detail_row({
+        **raw,
+        "Queue": "1000",
+        "Status": "Cevapsız",
+    })
+
+    assert conversation["Date"] == "09.10.2026"
+    assert conversation["Time"] == "00:05:00"
+    assert missed["ChekInDate"] == "09.10.2026"
+    assert missed["ChekInTime"] == "00:05:00"
+
+
 def test_build_phone_dahili_cache_merges_queue_detail_and_conversations():
     """conversations boş olsa bile queue-detail/CDR satırından eşleme kurulmalı."""
     from invekto_client import _normalize_phone

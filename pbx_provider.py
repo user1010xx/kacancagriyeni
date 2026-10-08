@@ -37,7 +37,9 @@ class PbxError(Exception):
 
 
 _ROUTING_CACHE_LOCK = threading.Lock()
-_ROUTING_DAY_CACHE: OrderedDict[tuple, tuple[float, list[dict[str, Any]]]] = OrderedDict()
+_ROUTING_DAY_CACHE: OrderedDict[
+    tuple, tuple[float, list[dict[str, Any]], date]
+] = OrderedDict()
 _ROUTING_CACHE_MAX_DAYS = 64
 
 
@@ -111,11 +113,13 @@ def fetch_routing_conversations(
         key = (*identity, day)
         with _ROUTING_CACHE_LOCK:
             now = time.monotonic()
-            ttl = 15 if day >= _routing_today() else 3600
+            today = _routing_today()
+            ttl = 15 if day >= today else 3600
             cached = _ROUTING_DAY_CACHE.get(key)
-            if cached is None or now - cached[0] >= ttl:
+            crossed_midnight = cached is not None and cached[2] == day and today > day
+            if cached is None or crossed_midnight or now - cached[0] >= ttl:
                 rows = fetch_conversations(company_code, day, day, **kwargs)
-                _ROUTING_DAY_CACHE[key] = (time.monotonic(), rows)
+                _ROUTING_DAY_CACHE[key] = (time.monotonic(), rows, today)
             else:
                 rows = cached[1]
             _ROUTING_DAY_CACHE.move_to_end(key)

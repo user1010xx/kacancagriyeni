@@ -55,6 +55,28 @@ def test_routing_refreshes_today_without_reloading_history(monkeypatch):
         assert fetch.call_count == 5
 
 
+def test_routing_refreshes_today_entry_once_after_midnight(monkeypatch):
+    from datetime import date, timedelta
+    import pbx_provider as provider
+
+    first_day = date(2026, 9, 12)
+    current_day = [first_day]
+    clock = [0.0]
+    monkeypatch.setattr(provider, "_routing_today", lambda: current_day[0])
+    monkeypatch.setattr(provider.time, "monotonic", lambda: clock[0])
+
+    with patch.object(provider, "fetch_conversations", side_effect=[
+        [{"Extension": "646"}],
+        [{"Extension": "657"}],
+    ]) as fetch:
+        assert provider.fetch_routing_conversations("rollover", first_day, first_day)[0]["Extension"] == "646"
+        current_day[0] = first_day + timedelta(days=1)
+        clock[0] = 20
+        assert provider.fetch_routing_conversations("rollover", first_day, first_day)[0]["Extension"] == "657"
+        assert provider.fetch_routing_conversations("rollover", first_day, first_day)[0]["Extension"] == "657"
+        assert fetch.call_count == 2
+
+
 def test_expired_routing_cache_does_not_hide_refresh_failure(monkeypatch):
     from datetime import date
     import pbx_provider as provider

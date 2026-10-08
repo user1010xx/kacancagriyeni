@@ -411,14 +411,36 @@ def _parse_turkish_long_date(value: str) -> str:
     return ""
 
 
+def _parse_combined_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value or "").strip()
+        if not text or not (
+            len(text) >= 16
+            and text[4] == "-"
+            and text[7] == "-"
+            and text[10] in {"T", " "}
+        ):
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(_report_tz()).replace(tzinfo=None)
+    return parsed
+
+
 def _normalize_call_date(value: Any) -> str:
     text = str(value or "").strip()
     if not text:
         return ""
 
-    # ISO datetime: yalnızca tarih kısmını al (T ayırıcı). "Temmuz" içindeki T'ye dokunma.
-    if "T" in text and len(text) >= 10 and text[4] == "-" and text[7] == "-":
-        text = text.split("T", 1)[0]
+    combined = _parse_combined_datetime(value)
+    if combined is not None:
+        return combined.strftime("%d.%m.%Y")
 
     # Standart formatlar
     for candidate in (text, text[:10]):
@@ -446,13 +468,9 @@ def _normalize_time(value: Any) -> str:
     text = str(value or "").strip()
     if not text:
         return ""
-    if "T" in text and " " not in text:
-        # datetime ISO içinde saat
-        try:
-            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-            return parsed.strftime("%H:%M:%S")
-        except ValueError:
-            pass
+    combined = _parse_combined_datetime(value)
+    if combined is not None:
+        return combined.strftime("%H:%M:%S")
     for fmt in ("%H:%M:%S", "%H:%M"):
         try:
             return datetime.strptime(text, fmt).strftime("%H:%M:%S")
@@ -494,6 +512,8 @@ def normalize_queue_detail_row(record: dict[str, Any]) -> dict[str, Any]:
         "Date",
         "date",
         "callDate",
+        "datetime",
+        "DateTime",
         "Tarih",
         "tarih",
         "TARİH",
@@ -509,8 +529,11 @@ def normalize_queue_detail_row(record: dict[str, Any]) -> dict[str, Any]:
         "saat",
         "SAAT",
     )
-    # Tek datetime alanında birleşik gelebilir
-    if not call_time_raw and call_date_raw and "T" in call_date_raw:
+    combined_raw = _field(record, "datetime", "DateTime")
+    if _parse_combined_datetime(combined_raw) is not None:
+        call_date_raw = combined_raw
+        call_time_raw = combined_raw
+    elif not call_time_raw and _parse_combined_datetime(call_date_raw) is not None:
         call_time_raw = call_date_raw
 
     status = _field(
@@ -735,8 +758,11 @@ def normalize_conversation_row(record: dict[str, Any]) -> dict[str, Any]:
     if not call_time_raw:
         call_time_raw = _field_slug_contains(record, "saat", "time")
 
-    # Tek datetime alanında birleşik gelebilir
-    if not call_time_raw and call_date_raw and ("T" in str(call_date_raw) or " " in str(call_date_raw)):
+    combined_raw = _field(record, "datetime", "DateTime")
+    if _parse_combined_datetime(combined_raw) is not None:
+        call_date_raw = combined_raw
+        call_time_raw = combined_raw
+    elif not call_time_raw and _parse_combined_datetime(call_date_raw) is not None:
         call_time_raw = call_date_raw
 
     # Dahili numarası (622) — UI/Excel: DAHİLİ NUMARASI / Dahili Numarası
