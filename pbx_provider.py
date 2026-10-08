@@ -43,7 +43,7 @@ _ROUTING_DAY_CACHE: OrderedDict[
 ] = OrderedDict()
 _ROUTING_DAY_INFLIGHT: dict[tuple, Future[list[dict[str, Any]]]] = {}
 _ROUTING_CACHE_MAX_DAYS = 64
-_ROUTING_FETCH_WORKERS = 4
+_ROUTING_FETCH_WORKERS = 2
 
 
 def _routing_today() -> date:

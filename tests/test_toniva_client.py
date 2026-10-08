@@ -1,4 +1,5 @@
 from datetime import date
+import pytest
 from unittest.mock import patch
 
 from toniva_client import (
@@ -11,6 +12,8 @@ from toniva_client import (
     normalize_queue_detail_row,
     queues_match,
     fetch_missed_calls,
+    TonivaError,
+    _request_json,
 )
 
 
@@ -19,6 +22,24 @@ def test_key_slug_turkish_headers():
     assert _key_slug("Kuyruk Adı") == "kuyrukadi"
     assert _key_slug("TARİH") == "tarih" or _key_slug("TARİH").startswith("tari")
     assert _key_slug("DURUM") == "durum"
+
+
+def test_request_json_reports_exhausted_rate_limit(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("TONIVA_API_KEY", "test-key")
+    response = SimpleNamespace(
+        status_code=429,
+        headers={"Retry-After": "0"},
+        content=b"",
+        text="rate limited",
+    )
+    with patch("toniva_client.requests.request", return_value=response) as request:
+        with patch("toniva_client.time.sleep"):
+            with pytest.raises(TonivaError, match="HTTP 429"):
+                _request_json("GET", "/reports/conversations", timeout=1)
+
+    assert request.call_count == 3
 
 
 def test_is_missed_status_cevapsiz():

@@ -414,6 +414,13 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     yesterday = today - timedelta(days=1)
     delivered_today = len(delivered_store.get_by_call_date(today))
     delivered_yesterday = len(delivered_store.get_by_call_date(yesterday))
+    last_failure = bot_data.get("last_poll_failure")
+    last_failure_time = bot_data.get("last_poll_failure_time")
+    failure_line = (
+        f"⚠️ Son başarısız poll: {last_failure_time or '-'} | {last_failure}\n"
+        if last_failure
+        else ""
+    )
 
     provider_label = "Toniva" if config.is_toniva else "Invekto"
     auth_line = (
@@ -437,6 +444,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"🕒 Son poll zamanı: {bot_data.get('last_poll_time', '-')}\n"
         f"⚡ Son API süresi: {bot_data.get('last_api_duration_ms', '-')} ms\n"
         f"❌ Son poll hatası: {bot_data.get('last_poll_error', '-')}\n"
+        f"{failure_line}"
         f"📭 Başarısız DM (bu oturum): {bot_data.get('failed_dm_count', 0)}\n"
     )
     await update.message.reply_text(text)
@@ -1371,6 +1379,7 @@ async def poll_missed_calls(context: ContextTypes.DEFAULT_TYPE) -> None:
     sent_now = failed_dm = 0
     success = True
     poll_error = "-"
+    failure_summary = ""
     for target in sorted(dates, reverse=True):
         try:
             sent_count, failed_count = await _process_missed_calls_for_date(context.bot, target, context=context)
@@ -1382,6 +1391,14 @@ async def poll_missed_calls(context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception as exc:
             success = False
             poll_error = str(exc)
+            failure_detail = (
+                f"{target.isoformat()}: {type(exc).__name__}: {exc}"
+            )
+            failure_summary = f"{target.isoformat()} ({type(exc).__name__})"
+            context.bot_data["last_poll_failure"] = failure_detail
+            context.bot_data["last_poll_failure_time"] = dtm.now(
+                REPORT_TZ
+            ).strftime("%d.%m.%Y %H:%M:%S")
             logger.exception("Poll başarısız")
     if success:
         config.last_poll_date = today
@@ -1395,7 +1412,14 @@ async def poll_missed_calls(context: ContextTypes.DEFAULT_TYPE) -> None:
         if time.monotonic() - last_alert >= 900:
             context.bot_data["last_poll_alert"] = time.monotonic()
             try:
-                await send_with_retry(context.bot.send_message, chat_id=config.target_chat_id, text="Çağrı taramasında hata var; bekleyen kayıtlar korunuyor. /stats ile kontrol edin.")
+                await send_with_retry(
+                    context.bot.send_message,
+                    chat_id=config.target_chat_id,
+                    text=(
+                        f"Çağrı taraması başarısız: {failure_summary}; "
+                        "bekleyen kayıtlar korunuyor. Ayrıntı için /stats."
+                    ),
+                )
             except Exception:
                 logger.exception("Poll hata uyarısı gönderilemedi")
 

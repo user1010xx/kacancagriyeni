@@ -160,6 +160,8 @@ def test_poll_retains_error_when_later_day_succeeds(delivery, monkeypatch):
     context = SimpleNamespace(bot=telegram, bot_data={})
     asyncio.run(app.poll_missed_calls(context))
     assert context.bot_data["last_poll_error"] == "failure"
+    assert "PbxError: failure" in context.bot_data["last_poll_failure"]
+    assert context.bot_data["last_poll_failure_time"]
     assert app.config.last_poll_date == today - timedelta(days=2)
     assert process.await_count == 3
 

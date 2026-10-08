@@ -295,6 +295,10 @@ def _request_json(
                 timeout=timeout,
             )
             if response.status_code == 429:
+                if attempt == 2:
+                    raise TonivaError(
+                        "Toniva HTTP 429: rate limit after 3 attempts"
+                    )
                 retry_after = response.headers.get("Retry-After", "")
                 try:
                     wait = float(retry_after)

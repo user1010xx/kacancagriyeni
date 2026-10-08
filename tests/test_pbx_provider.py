@@ -36,14 +36,21 @@ def test_concurrent_routing_requests_share_daily_fetch():
 
 def test_routing_history_fetches_distinct_days_concurrently():
     from datetime import date, timedelta
-    from threading import Barrier
+    from threading import Barrier, Lock
     import pbx_provider as provider
 
     start = date(2026, 9, 10)
-    barrier = Barrier(3)
+    barrier = Barrier(2)
+    lock = Lock()
+    calls_started = 0
 
     def fetch_day(company_code, day_start, day_end, **kwargs):
-        barrier.wait(timeout=5)
+        nonlocal calls_started
+        with lock:
+            calls_started += 1
+            wait_for_other_worker = calls_started <= 2
+        if wait_for_other_worker:
+            barrier.wait(timeout=5)
         return [{"Date": day_start.isoformat()}]
 
     with patch.object(provider, "fetch_conversations", side_effect=fetch_day) as fetch:
