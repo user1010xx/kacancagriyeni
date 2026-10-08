@@ -128,6 +128,31 @@ def test_routing_api_failure_keeps_pending_without_sending(delivery, monkeypatch
     assert app.delivered_store.get_by_call_date(today) == []
 
 
+def test_routing_history_retries_transient_failure(delivery, monkeypatch):
+    today, call, telegram = delivery
+    app.phone_map_store.set(call["Phone"], "105")
+    app.personnel_store.add_or_update("105", "Ali", "ali", telegram_chat_id="123")
+    from unittest.mock import Mock
+
+    fetch = Mock(side_effect=[
+        app.PbxError("temporary"),
+        [{
+            "Phone": call["Phone"],
+            "Extension": "105",
+            "Direction": "outbound",
+            "Date": call["ChekInDate"],
+            "Time": "11:00:00",
+        }],
+    ])
+    monkeypatch.setattr(app, "fetch_routing_conversations", fetch)
+    monkeypatch.setattr(app.asyncio, "sleep", AsyncMock())
+
+    asyncio.run(app._process_missed_calls_for_date(telegram, today))
+
+    assert fetch.call_count == 2
+    assert app.sent_store.is_complete_any(app.call_key_variants(call))
+
+
 def test_debug_routing_uses_requested_call_time_without_mutation(delivery, monkeypatch):
     today, call, telegram = delivery
     app.personnel_store.add_or_update("657", "Mahmut", "mahmut", telegram_chat_id="65700")
@@ -155,12 +180,14 @@ def test_debug_routing_uses_requested_call_time_without_mutation(delivery, monke
 def test_poll_retains_error_when_later_day_succeeds(delivery, monkeypatch):
     today, call, telegram = delivery
     app.config.last_poll_date = today - timedelta(days=2)
-    process = AsyncMock(side_effect=[app.PbxError("failure"), (0, 0), (0, 0)])
+    failure = app.PbxError("Yönlendirme için dış arama geçmişi alınamadı")
+    failure.__cause__ = RuntimeError("Toniva HTTP 429")
+    process = AsyncMock(side_effect=[failure, (0, 0), (0, 0)])
     monkeypatch.setattr(app, "_process_missed_calls_for_date", process)
     context = SimpleNamespace(bot=telegram, bot_data={})
     asyncio.run(app.poll_missed_calls(context))
-    assert context.bot_data["last_poll_error"] == "failure"
-    assert "PbxError: failure" in context.bot_data["last_poll_failure"]
+    assert context.bot_data["last_poll_error"] == str(failure)
+    assert "RuntimeError: Toniva HTTP 429" in context.bot_data["last_poll_failure"]
     assert context.bot_data["last_poll_failure_time"]
     assert app.config.last_poll_date == today - timedelta(days=2)
     assert process.await_count == 3

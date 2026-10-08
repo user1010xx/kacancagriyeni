@@ -1279,15 +1279,42 @@ async def _process_missed_calls_for_date(
         calls = [call for call in calls if not state.is_complete_any(call_key_variants(call))]
         if not calls or (should_cancel and should_cancel()):
             return 0, 0
+        for attempt in range(2):
+            try:
+                conversations = await asyncio.to_thread(
+                    fetch_routing_conversations,
+                    company_code,
+                    target_date - timedelta(days=15),
+                    target_date,
+                )
+                break
+            except Exception as exc:
+                if attempt == 0:
+                    logger.warning(
+                        "Yönlendirme geçmişi alınamadı (%s); yeniden deneniyor: %s",
+                        target_date.isoformat(),
+                        exc,
+                    )
+                    await asyncio.sleep(1)
+                    continue
+                logger.exception(
+                    "Yönlendirme geçmişi alınamadı (%s)",
+                    target_date.isoformat(),
+                )
+                raise PbxError(
+                    "Yönlendirme için dış arama geçmişi alınamadı"
+                ) from exc
+
         try:
-            conversations = await asyncio.to_thread(
-                fetch_routing_conversations, company_code,
-                target_date - timedelta(days=15), target_date,
-            )
             outbound_history = build_outbound_history(conversations)
         except Exception as exc:
-            logger.exception("Yönlendirme geçmişi alınamadı (%s)", target_date.isoformat())
-            raise PbxError("Yönlendirme için dış arama geçmişi alınamadı") from exc
+            logger.exception(
+                "Yönlendirme geçmişi işlenemedi (%s)",
+                target_date.isoformat(),
+            )
+            raise PbxError(
+                "Yönlendirme için dış arama geçmişi işlenemedi"
+            ) from exc
 
         for call in calls:
             if should_cancel and should_cancel():
@@ -1391,10 +1418,15 @@ async def poll_missed_calls(context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception as exc:
             success = False
             poll_error = str(exc)
+            root_cause = exc
+            while root_cause.__cause__ is not None:
+                root_cause = root_cause.__cause__
             failure_detail = (
-                f"{target.isoformat()}: {type(exc).__name__}: {exc}"
+                f"{target.isoformat()}: {type(root_cause).__name__}: {root_cause}"
             )
-            failure_summary = f"{target.isoformat()} ({type(exc).__name__})"
+            failure_summary = (
+                f"{target.isoformat()} ({type(root_cause).__name__})"
+            )
             context.bot_data["last_poll_failure"] = failure_detail
             context.bot_data["last_poll_failure_time"] = dtm.now(
                 REPORT_TZ
