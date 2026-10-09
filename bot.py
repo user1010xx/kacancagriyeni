@@ -1115,12 +1115,26 @@ async def debugeslesme_command(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text("Çağrı öncesi dış arama geçmişi sorgulanıyor...")
     try:
         rows = await asyncio.to_thread(
-            fetch_routing_conversations, company_code, when.date() - timedelta(days=15), when.date(),
+            fetch_routing_conversations,
+            company_code,
+            when.date() - timedelta(days=15),
+            when.date(),
+            allow_partial=True,
         )
         history = build_outbound_history(rows)
         call = {"Phone": phone, "ChekInDate": when.date().isoformat(), "ChekInTime": when.strftime("%H:%M:%S")}
         extension = lookup_outbound_before_call(call, history)
         personnel = personnel_store.find_for_extension(extension) if extension else None
+        incomplete_dates = sorted(getattr(history, "incomplete_dates", ()))
+        lines.append(f"CDR kaydı (15 gün): {len(history.get(pk, []))}")
+        lines.append(
+            "Eksik CDR günleri: "
+            + (
+                ", ".join(day.strftime("%d.%m.%Y") for day in incomplete_dates)
+                if incomplete_dates
+                else "yok"
+            )
+        )
         lines.append(f"Seçilen dahili: {extension or 'YOK / BELİRSİZ'}")
         lines.append(f"Personel: {personnel.get('personel_adi') if personnel else 'YOK'}")
         prior = [(stamp, ext) for stamp, ext in history.get(pk, [])

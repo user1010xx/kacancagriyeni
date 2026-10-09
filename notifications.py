@@ -119,6 +119,7 @@ class MissedCallContext:
     kind: NotifyKind
     group_notified_before: bool
     private_notified_before: bool
+    routing_history_incomplete: bool = False
 
 
 def build_call_time_str(call: dict[str, Any]) -> str:
@@ -148,9 +149,18 @@ def build_missed_call_context(
     )(key_variants)
     phone = str(call.get("Phone") or "")
     call_time_str = build_call_time_str(call)
+    routing_history_incomplete = False
 
     if outbound_history is not None:
         dahili = lookup_outbound_before_call(call, outbound_history)
+        call_date, call_time = _call_datetime(call)
+        call_when = _parse_conversation_datetime(call_date, call_time)
+        if call_when != dtm.min:
+            earliest = call_when.date() - timedelta(days=15)
+            routing_history_incomplete = any(
+                earliest <= missing_day <= call_when.date()
+                for missing_day in getattr(outbound_history, "incomplete_dates", ())
+            )
     else:
         dahili = phone_map_store.lookup_manual(phone) if phone_map_store is not None else None
         dahili = dahili or lookup_dahili_from_cache(dahili_cache, phone)
@@ -170,6 +180,7 @@ def build_missed_call_context(
             kind=NotifyKind.NO_DAHILI,
             group_notified_before=group_notified_before,
             private_notified_before=False,
+            routing_history_incomplete=routing_history_incomplete,
         )
 
     personnel = personnel_store.find_for_extension(dahili)
@@ -237,6 +248,14 @@ def build_private_text(personel_adi: str, phone: str, call_time_str: str) -> str
 
 def build_group_text(ctx: MissedCallContext, *, private_ok: bool) -> str:
     if ctx.kind == NotifyKind.NO_DAHILI:
+        if getattr(ctx, "routing_history_incomplete", False):
+            return (
+                "🔴 Kaçan Çağrı\n\n"
+                f"📞 Telefon: {ctx.phone}\n"
+                f"🕐 Arama Saati: {ctx.call_time_str}\n"
+                "⚠️ Yönlendirme geçmişinde eksik CDR günü var; "
+                "personel eşleşmesi doğrulanamadı."
+            )
         return (
             "🔴 Kaçan Çağrı\n\n"
             f"📞 Telefon: {ctx.phone}\n"

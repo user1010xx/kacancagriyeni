@@ -210,6 +210,7 @@ def test_debug_routing_uses_requested_call_time_without_mutation(delivery, monke
     assert "13:47:07" in result
     assert "14:05:00" not in result
     assert fetch.call_args.args[1:] == (datetime(2026, 8, 28).date(), datetime(2026, 9, 12).date())
+    assert fetch.call_args.kwargs["allow_partial"] is True
     assert app.phone_map_store.lookup(row["Phone"]) == "646"
     assert app.sent_store.pending_calls(today) == []
     telegram.send_message.assert_not_awaited()

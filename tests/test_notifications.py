@@ -160,6 +160,34 @@ def test_partial_history_trusts_rows_after_missing_days_only():
     ) is None
 
 
+def test_incomplete_routing_history_is_not_reported_as_no_personnel_match(tmp_path):
+    from datetime import date
+    from notifications import build_outbound_history
+    from pbx_provider import RoutingConversationRows
+
+    call = {
+        "Phone": "5307642914",
+        "ChekInDate": "09.10.2026",
+        "ChekInTime": "16:25:59",
+    }
+    history = build_outbound_history(
+        RoutingConversationRows([], incomplete_dates={date(2026, 10, 9)})
+    )
+    context = build_missed_call_context(
+        call,
+        dahili_cache={},
+        personnel_store=PersonnelStore(tmp_path / "people.json"),
+        sent_store=_FakeSentStore(),
+        outbound_history=history,
+    )
+
+    assert context is not None
+    assert context.routing_history_incomplete
+    message = build_group_text(context, private_ok=False)
+    assert "eksik CDR günü" in message
+    assert "Son 15 günde eşleşen personel bulunamadı" not in message
+
+
 def test_build_private_text_format():
     msg = build_private_text("seda", "905301718596", "27.06.2026 11:02:13")
     assert "🔴 Kaçan Çağrı" in msg
