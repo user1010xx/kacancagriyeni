@@ -115,17 +115,24 @@ def test_wrong_recipient_incident_routes_to_mahmut(delivery, monkeypatch):
     assert fetch.call_count == 1
 
 
-def test_routing_api_failure_keeps_pending_without_sending(delivery, monkeypatch):
+def test_routing_api_failure_falls_back_to_saved_phone_mapping(delivery, monkeypatch):
     today, call, telegram = delivery
     app.phone_map_store.set(call["Phone"], "105")
     app.personnel_store.add_or_update("105", "Ali", "ali", telegram_chat_id="123")
     from unittest.mock import Mock
+
     monkeypatch.setattr(app, "fetch_routing_conversations", Mock(side_effect=app.PbxError("offline")))
-    with pytest.raises(app.PbxError):
-        asyncio.run(app._process_missed_calls_for_date(telegram, today))
-    telegram.send_message.assert_not_awaited()
-    assert app.sent_store.pending_calls(today)
-    assert app.delivered_store.get_by_call_date(today) == []
+    monkeypatch.setattr(app.asyncio, "sleep", AsyncMock())
+    context = SimpleNamespace(bot=telegram, bot_data={})
+
+    assert asyncio.run(
+        app._process_missed_calls_for_date(telegram, today, context=context)
+    ) == (1, 0)
+
+    assert telegram.send_message.await_count == 2
+    assert app.sent_store.is_complete_any(app.call_key_variants(call))
+    assert len(app.delivered_store.get_by_call_date(today)) == 1
+    assert "yönlendirme=yedek" in context.bot_data["last_today_delivery"]
 
 
 def test_routing_history_retries_transient_failure(delivery, monkeypatch):
@@ -180,6 +187,8 @@ def test_today_scan_summary_is_exposed_in_stats_data(delivery):
 
     assert "API=1" in context.bot_data["last_today_scan"]
     assert "uygun=1" in context.bot_data["last_today_scan"]
+    assert "yönlendirme=PBX" in context.bot_data["last_today_delivery"]
+    assert "grup_gönderildi=1" in context.bot_data["last_today_delivery"]
 
 
 def test_debug_routing_uses_requested_call_time_without_mutation(delivery, monkeypatch):

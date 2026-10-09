@@ -445,6 +445,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"🕒 Son poll zamanı: {bot_data.get('last_poll_time', '-')}\n"
         f"⚡ Son API süresi: {bot_data.get('last_api_duration_ms', '-')} ms\n"
         f"🔎 Bugünkü tarama: {bot_data.get('last_today_scan', '-')}\n"
+        f"📨 Bugünkü gönderim: {bot_data.get('last_today_delivery', '-')}\n"
         f"❌ Son poll hatası: {bot_data.get('last_poll_error', '-')}\n"
         f"{failure_line}"
         f"📭 Başarısız DM (bu oturum): {bot_data.get('failed_dm_count', 0)}\n"
@@ -1331,6 +1332,7 @@ async def _process_missed_calls_for_date(
             )
         if not calls:
             return 0, 0
+        outbound_history = None
         for attempt in range(2):
             try:
                 conversations = await asyncio.to_thread(
@@ -1353,21 +1355,40 @@ async def _process_missed_calls_for_date(
                     "Yönlendirme geçmişi alınamadı (%s)",
                     target_date.isoformat(),
                 )
-                raise PbxError(
-                    "Yönlendirme için dış arama geçmişi alınamadı"
-                ) from exc
+                logger.warning(
+                    "Yönlendirme geçmişi alınamadı (%s); kayıtlı telefon eşlemesi "
+                    "ve grup bildirimiyle devam ediliyor: %s",
+                    target_date.isoformat(),
+                    exc,
+                )
+                conversations = None
+                break
 
-        try:
-            outbound_history = build_outbound_history(conversations)
-        except Exception as exc:
-            logger.exception(
-                "Yönlendirme geçmişi işlenemedi (%s)",
-                target_date.isoformat(),
-            )
-            raise PbxError(
-                "Yönlendirme için dış arama geçmişi işlenemedi"
-            ) from exc
+        if conversations is not None:
+            try:
+                outbound_history = build_outbound_history(conversations)
+            except Exception as exc:
+                logger.exception(
+                    "Yönlendirme geçmişi işlenemedi (%s)",
+                    target_date.isoformat(),
+                )
+                logger.warning(
+                    "Yönlendirme geçmişi kullanılamıyor (%s); kayıtlı telefon "
+                    "eşlemesi ve grup bildirimiyle devam ediliyor: %s",
+                    target_date.isoformat(),
+                    exc,
+                )
 
+        route_counts = {
+            "personnel": 0,
+            "no_dahili": 0,
+            "no_personnel": 0,
+            "private_sent": 0,
+            "group_sent": 0,
+            "group_previously_sent": 0,
+            "private_failed": 0,
+            "group_failed": 0,
+        }
         for call in calls:
             if should_cancel and should_cancel():
                 logger.info(
@@ -1387,6 +1408,10 @@ async def _process_missed_calls_for_date(
             )
             if notify_ctx is None:
                 continue
+
+            route_counts[notify_ctx.kind.value] += 1
+            if notify_ctx.group_notified_before:
+                route_counts["group_previously_sent"] += 1
 
             key_variants = call_key_variants(call)
 
@@ -1413,6 +1438,18 @@ async def _process_missed_calls_for_date(
 
             if counts_as_failed_dm(notify_ctx, private_ok):
                 failed_dm += 1
+                route_counts["private_failed"] += 1
+            elif (
+                notify_ctx.kind == NotifyKind.PERSONNEL
+                and not notify_ctx.private_notified_before
+                and private_ok
+            ):
+                route_counts["private_sent"] += 1
+
+            if group_sent_at is not None:
+                route_counts["group_sent"] += 1
+            elif not group_ok:
+                route_counts["group_failed"] += 1
 
             if should_mark_complete(notify_ctx, private_ok=private_ok, group_ok=group_ok):
                 state.mark_complete_keys(key_variants, save=True)
@@ -1422,6 +1459,22 @@ async def _process_missed_calls_for_date(
 
             if throttle_seconds > 0:
                 await asyncio.sleep(throttle_seconds)
+
+        if context is not None and target_date == _report_today():
+            _update_bot_data(
+                context,
+                last_today_delivery=(
+                    f"yönlendirme={'PBX' if outbound_history is not None else 'yedek'}, "
+                    f"personel={route_counts['personnel']}, "
+                    f"dahili_yok={route_counts['no_dahili']}, "
+                    f"personel_yok={route_counts['no_personnel']}, "
+                    f"DM_gönderildi={route_counts['private_sent']}, "
+                    f"grup_gönderildi={route_counts['group_sent']}, "
+                    f"grup_zaten_var={route_counts['group_previously_sent']}, "
+                    f"DM_hata={route_counts['private_failed']}, "
+                    f"grup_hata={route_counts['group_failed']}"
+                ),
+            )
 
         return sent_now, failed_dm
 
