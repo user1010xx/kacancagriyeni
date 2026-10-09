@@ -1250,6 +1250,7 @@ async def _process_missed_calls_for_date(
                 uncompleted_only=config.notify_uncompleted_only,
                 **_fetch_kwargs(),
             )
+            api_call_count = len(calls)
             api_ms = int((time.monotonic() - api_started) * 1000)
             if context is not None:
                 _update_bot_data(
@@ -1270,15 +1271,31 @@ async def _process_missed_calls_for_date(
         if should_cancel and should_cancel():
             return 0, 0
 
-        calls = dedupe_calls_by_key(calls + state.pending_calls(target_date))
+        pending_calls = state.pending_calls(target_date)
+        pending_call_count = len(pending_calls)
+        calls = dedupe_calls_by_key(calls + pending_calls)
+        unique_call_count = len(calls)
         state.remember_calls(calls)
 
         cutoff = after_time or _cutoff_time_for_date(target_date)
         if cutoff:
             calls = _apply_time_cutoff(calls, target_date, cutoff, delivery_state=state)
 
+        after_cutoff_count = len(calls)
         calls = [call for call in calls if not state.is_complete_any(call_key_variants(call))]
-        if not calls or (should_cancel and should_cancel()):
+        if should_cancel and should_cancel():
+            return 0, 0
+        logger.info(
+            "Kaçan çağrı işleme (%s): api=%s pending=%s unique=%s "
+            "after_cutoff=%s eligible=%s",
+            target_date.isoformat(),
+            api_call_count,
+            pending_call_count,
+            unique_call_count,
+            after_cutoff_count,
+            len(calls),
+        )
+        if not calls:
             return 0, 0
         for attempt in range(2):
             try:

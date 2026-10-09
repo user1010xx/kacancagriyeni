@@ -1065,8 +1065,10 @@ def fetch_missed_calls(
         )
 
     logger.info(
-        "Toniva missed: raw=%s missed=%s after_queue=%s "
+        "Toniva missed (%s … %s): raw=%s missed=%s after_queue=%s "
         "(no_status=%s not_missed=%s no_phone=%s completed=%s weak_dt=%s queue=%s)",
+        start_date,
+        end_date,
         len(rows),
         before_queue,
         len(missed),
