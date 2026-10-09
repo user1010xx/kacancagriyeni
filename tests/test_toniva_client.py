@@ -173,6 +173,67 @@ def test_fetch_missed_calls_matches_queue_display_format():
     assert calls[0]["Phone"] == "905551112233"
 
 
+def test_fetch_missed_calls_reads_all_343_queue_detail_rows(monkeypatch):
+    from datetime import date as d
+
+    monkeypatch.setattr("toniva_client._report_page_size", lambda: 10)
+    requested_pages = []
+
+    def fetch_page(slug, start_date, end_date, **kwargs):
+        assert slug == "queue-detail"
+        page = kwargs["page"]
+        requested_pages.append(page)
+        start = (page - 1) * 10
+        stop = min(start + 10, 343)
+        rows = [
+            {
+                "ID": str(index),
+                "Phone": f"530{index:07d}",
+                "Queue": "1000 (1000)",
+                "Date": "2026-10-09",
+                "Time": "15:00:00",
+                "Status": "Cevapsız",
+            }
+            for index in range(start, stop)
+        ]
+        return rows, {"total_count": 343}
+
+    with patch("toniva_client.fetch_report", side_effect=fetch_page):
+        calls = fetch_missed_calls(
+            "toniva",
+            d(2026, 10, 9),
+            d(2026, 10, 9),
+            department_names=["1000"],
+        )
+
+    assert len(calls) == 343
+    assert requested_pages == list(range(1, 36))
+
+
+def test_fetch_missed_calls_rejects_incomplete_queue_detail_pages(monkeypatch):
+    monkeypatch.setattr("toniva_client._report_page_size", lambda: 10)
+    row = {
+        "ID": "1",
+        "Phone": "5300000001",
+        "Queue": "1000",
+        "Date": "2026-10-09",
+        "Time": "15:00:00",
+        "Status": "Cevapsız",
+    }
+
+    with patch(
+        "toniva_client.fetch_report",
+        side_effect=[([row], {"total_count": 2}), ([], {"total_count": 2})],
+    ):
+        with pytest.raises(TonivaError, match="Queue-detail boş veya eksik sayfa"):
+            fetch_missed_calls(
+                "toniva",
+                date(2026, 10, 9),
+                date(2026, 10, 9),
+                department_names=["1000"],
+            )
+
+
 def test_fetch_missed_skips_rows_without_status():
     api_rows = [
         {"Phone": "905551112233", "Queue": "1000", "Date": "2026-07-18", "Time": "10:00:00"},

@@ -973,6 +973,89 @@ def _configured_queues() -> list[str] | None:
     return None
 
 
+def _fetch_queue_detail_pages(
+    start_date: date,
+    end_date: date,
+    *,
+    queue: str | None,
+    timeout: int,
+) -> list[dict[str, Any]]:
+    """Kuyruk detayını tüm sayfaları alarak getir; eksik sonucu başarılı sayma."""
+    page_size = _report_page_size()
+    all_rows: list[dict[str, Any]] = []
+    seen_fingerprints: set[str] = set()
+    max_pages = 200
+    meta_total: int | None = None
+
+    for page in range(1, max_pages + 1):
+        rows, meta = fetch_report(
+            "queue-detail",
+            start_date,
+            end_date,
+            queue=queue,
+            page=page,
+            page_size=page_size,
+            timeout=timeout,
+        )
+        truncated = str(meta.get("truncated", "false")).lower() == "true"
+
+        if meta_total is None:
+            raw_total = meta.get("total_count") or meta.get("totalCount") or meta.get("total")
+            try:
+                meta_total = int(raw_total) if raw_total is not None else None
+            except (TypeError, ValueError):
+                meta_total = None
+
+        if not rows:
+            if truncated or (meta_total is not None and len(all_rows) < meta_total):
+                raise TonivaError("Queue-detail boş veya eksik sayfa döndürdü")
+            break
+
+        new_count = 0
+        for row in rows:
+            fingerprint = str(
+                row.get("callId")
+                or row.get("CallID")
+                or row.get("id")
+                or row.get("ID")
+                or json.dumps(row, sort_keys=True, ensure_ascii=False, default=str)
+            )
+            if fingerprint in seen_fingerprints:
+                continue
+            seen_fingerprints.add(fingerprint)
+            all_rows.append(row)
+            new_count += 1
+
+        logger.info(
+            "Toniva queue-detail page=%s got=%s new=%s cumulative=%s "
+            "meta_total=%s range=%s…%s",
+            page,
+            len(rows),
+            new_count,
+            len(all_rows),
+            meta_total,
+            start_date,
+            end_date,
+        )
+
+        if meta_total is not None and len(all_rows) >= meta_total:
+            break
+        if new_count == 0:
+            raise TonivaError("Queue-detail aynı sayfayı tekrarlıyor")
+        if len(rows) < page_size and not truncated and (
+            meta_total is None or len(all_rows) >= meta_total
+        ):
+            break
+    else:
+        raise TonivaError("Queue-detail sayfa sınırı aşıldı")
+
+    if meta_total is not None and len(all_rows) < meta_total:
+        raise TonivaError(
+            f"Eksik queue-detail verisi: {len(all_rows)}/{meta_total}"
+        )
+    return all_rows
+
+
 def fetch_missed_calls(
     company_code: str,
     start_date: date,
@@ -1001,8 +1084,7 @@ def fetch_missed_calls(
     if names and len(names) == 1:
         queue_param = _canonical_queue_label(names[0]) or names[0]
 
-    rows, _meta = fetch_report(
-        "queue-detail",
+    rows = _fetch_queue_detail_pages(
         start_date,
         end_date,
         queue=queue_param,
@@ -1101,7 +1183,7 @@ def fetch_missed_calls(
     return missed
 
 
-def _conversations_page_size() -> int:
+def _report_page_size() -> int:
     try:
         return max(50, min(int(os.getenv("TONIVA_PAGE_SIZE", "5000")), 5000))
     except ValueError:
@@ -1122,7 +1204,7 @@ def _fetch_conversations_pages(
     truncated=false olduğu için eski kod sayfalamayı hiç başlatmıyordu.
     Excel export günde ~6800 satır; 30 satırla personel eşlemesi imkânsız.
     """
-    page_size = _conversations_page_size()
+    page_size = _report_page_size()
     all_rows: list[dict[str, Any]] = []
     seen_fingerprints: set[str] = set()
     max_pages = 200
