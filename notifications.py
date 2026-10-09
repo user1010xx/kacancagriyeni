@@ -1,7 +1,7 @@
 import logging
 from bisect import bisect_left
 from dataclasses import dataclass
-from datetime import datetime as dtm
+from datetime import date, datetime as dtm
 from enum import Enum
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -31,11 +31,16 @@ def build_outbound_history(records: list[dict[str, Any]]) -> dict[str, list[tupl
         if sum(char.isdigit() for char in extension) >= 10:
             continue
         grouped.setdefault(phone, {}).setdefault(when, set()).add(extension)
-    return {
-        phone: [(when, next(iter(extensions)) if len(extensions) == 1 else None)
-                for when, extensions in sorted(hits.items())]
-        for phone, hits in grouped.items()
-    }
+    return OutboundHistory(
+        {
+            phone: [
+                (when, next(iter(extensions)) if len(extensions) == 1 else None)
+                for when, extensions in sorted(hits.items())
+            ]
+            for phone, hits in grouped.items()
+        },
+        incomplete_dates=getattr(records, "incomplete_dates", None),
+    )
 
 
 def lookup_outbound_before_call(call: dict[str, Any], history: dict) -> str | None:
@@ -46,6 +51,11 @@ def lookup_outbound_before_call(call: dict[str, Any], history: dict) -> str | No
     hits = history.get(_normalize_phone(call.get("Phone") or ""), [])
     index = bisect_left(hits, when, key=lambda hit: hit[0]) - 1
     if index < 0 or hits[index][0] < when - timedelta(days=15):
+        return None
+    if any(
+        hits[index][0].date() <= missing_day <= when.date()
+        for missing_day in getattr(history, "incomplete_dates", ())
+    ):
         return None
     return hits[index][1]
 
@@ -80,6 +90,17 @@ def lookup_dahili_from_cache(dahili_cache: dict, phone: str) -> str | None:
 
 _REPORT_TZ = ZoneInfo(os.getenv("BOT_TIMEZONE", "Europe/Istanbul"))
 logger = logging.getLogger(__name__)
+
+
+class OutboundHistory(dict[str, list[tuple[dtm, str | None]]]):
+    def __init__(
+        self,
+        records: dict[str, list[tuple[dtm, str | None]]],
+        *,
+        incomplete_dates: frozenset[date] | set[date] | None = None,
+    ) -> None:
+        super().__init__(records)
+        self.incomplete_dates = frozenset(incomplete_dates or ())
 
 
 class NotifyKind(str, Enum):

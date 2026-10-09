@@ -124,6 +124,42 @@ def test_routing_each_missed_call_uses_its_own_time():
     assert lookup_outbound_before_call({**call, "ChekInTime": "invalid"}, history) is None
 
 
+def test_partial_history_trusts_rows_after_missing_days_only():
+    from datetime import date
+    from notifications import build_outbound_history, lookup_outbound_before_call
+    from pbx_provider import RoutingConversationRows
+
+    cdr = {
+        "Phone": "905307642914",
+        "Extension": "665",
+        "Direction": "outbound",
+        "Date": "09.10.2026",
+        "Time": "16:25:25",
+    }
+    call = {
+        "Phone": "5307642914",
+        "ChekInDate": "09.10.2026",
+        "ChekInTime": "16:25:59",
+    }
+    complete_after_gap = RoutingConversationRows(
+        [cdr],
+        incomplete_dates={date(2026, 10, 6)},
+    )
+    incomplete_on_match_day = RoutingConversationRows(
+        [cdr],
+        incomplete_dates={date(2026, 10, 9)},
+    )
+
+    assert lookup_outbound_before_call(
+        call,
+        build_outbound_history(complete_after_gap),
+    ) == "665"
+    assert lookup_outbound_before_call(
+        call,
+        build_outbound_history(incomplete_on_match_day),
+    ) is None
+
+
 def test_build_private_text_format():
     msg = build_private_text("seda", "905301718596", "27.06.2026 11:02:13")
     assert "🔴 Kaçan Çağrı" in msg

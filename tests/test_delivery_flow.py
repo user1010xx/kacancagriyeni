@@ -34,7 +34,7 @@ def delivery(monkeypatch, tmp_path):
     monkeypatch.setattr(app, "_fetch_kwargs", lambda: {})
     monkeypatch.setattr(app, "_cutoff_time_for_date", lambda target: None)
     monkeypatch.setattr(app, "fetch_missed_calls", lambda *args, **kwargs: [call])
-    monkeypatch.setattr(app, "fetch_routing_conversations", lambda *args: [
+    monkeypatch.setattr(app, "fetch_routing_conversations", lambda *args, **kwargs: [
         {"Phone": call["Phone"], "Extension": "105", "Direction": "outbound",
          "Date": call["ChekInDate"], "Time": "11:00:00"},
     ])

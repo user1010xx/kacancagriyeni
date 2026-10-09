@@ -129,6 +129,32 @@ def test_expired_routing_cache_does_not_hide_refresh_failure(monkeypatch):
         assert fetch.call_count == 3
 
 
+def test_partial_routing_history_keeps_successful_days():
+    from datetime import date
+    import pbx_provider as provider
+
+    first_day = date(2026, 10, 5)
+    last_day = date(2026, 10, 7)
+    first_rows = [{"Phone": "5300000001", "Extension": "665"}]
+    last_rows = [{"Phone": "5300000002", "Extension": "622"}]
+
+    def fetch_day(company_code, start_date, end_date, **kwargs):
+        if start_date == date(2026, 10, 6):
+            raise provider.PbxError("Conversations aynı sayfayı tekrarlıyor")
+        return first_rows if start_date == first_day else last_rows
+
+    with patch.object(provider, "fetch_conversations", side_effect=fetch_day):
+        rows = provider.fetch_routing_conversations(
+            "partial-routing",
+            first_day,
+            last_day,
+            allow_partial=True,
+        )
+
+    assert rows == first_rows + last_rows
+    assert rows.incomplete_dates == {date(2026, 10, 6)}
+
+
 def test_routing_cache_is_scoped_to_credentials_and_bounded(monkeypatch):
     from datetime import date
     import pbx_provider as provider

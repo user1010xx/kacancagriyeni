@@ -382,6 +382,32 @@ def test_normalize_outbound_zero_talk_cdr_seda():
     assert row["ExtensionName"] == "seda"
 
 
+def test_screenshot_cdr_outbound_matches_missed_call_phone_and_time():
+    from notifications import build_outbound_history, lookup_outbound_before_call
+
+    outbound = normalize_conversation_row({
+        "YÖN": "Dış Arama",
+        "DAHİLİ ADI": "koray",
+        "DAHİLİ NUMARASI": "665",
+        "TELEFON": "905307642914",
+        "TARİH": "Cuma 09 Ekim 2026",
+        "SAAT": "16:25:25",
+        "GÖRÜŞME SÜRESİ": "00:00:22",
+    })
+    missed = normalize_queue_detail_row({
+        "Phone": "5307642914",
+        "Queue": "1000",
+        "Status": "Cevapsız",
+        "Date": "2026-10-09",
+        "Time": "16:25:59",
+    })
+
+    assert lookup_outbound_before_call(
+        missed,
+        build_outbound_history([outbound]),
+    ) == "665"
+
+
 def test_raw_toniva_utc_timestamps_route_incident_to_prior_caller(monkeypatch, tmp_path):
     from unittest.mock import MagicMock
 

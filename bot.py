@@ -1340,6 +1340,7 @@ async def _process_missed_calls_for_date(
                     company_code,
                     target_date - timedelta(days=15),
                     target_date,
+                    allow_partial=True,
                 )
                 break
             except Exception as exc:

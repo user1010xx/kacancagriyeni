@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import hashlib
+import logging
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -17,6 +18,20 @@ from typing import Any
 
 import invekto_client
 import toniva_client
+
+logger = logging.getLogger(__name__)
+
+
+class RoutingConversationRows(list[dict[str, Any]]):
+    def __init__(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        incomplete_dates: set[date] | None = None,
+    ) -> None:
+        super().__init__(rows)
+        self.incomplete_dates = frozenset(incomplete_dates or ())
+
 
 # Ortak yardımcılar — her iki provider sonrası normalize dict ile çalışır
 from invekto_client import (  # noqa: F401
@@ -99,8 +114,13 @@ def fetch_conversations(
 
 
 def fetch_routing_conversations(
-    company_code: str, start_date: date, end_date: date,
+    company_code: str,
+    start_date: date,
+    end_date: date,
+    *,
+    allow_partial: bool = False,
 ) -> list[dict[str, Any]]:
+    """Fetch routing CDRs; partial mode retains successful days and marks gaps."""
     kwargs = {"include_zero_duration": True, "force_day_chunk": True} if is_toniva() else {}
     if end_date < start_date:
         start_date, end_date = end_date, start_date
@@ -114,6 +134,8 @@ def fetch_routing_conversations(
         start_date + timedelta(days=offset)
         for offset in range((end_date - start_date).days + 1)
     ]
+    incomplete_dates: set[date] = set()
+    incomplete_dates_lock = threading.Lock()
 
     def fetch_day(day: date) -> list[dict[str, Any]]:
         key = (*identity, day)
@@ -157,15 +179,32 @@ def fetch_routing_conversations(
             pending.set_result(rows)
         return [dict(row) for row in rows]
 
+    def fetch_day_with_fallback(day: date) -> list[dict[str, Any]]:
+        try:
+            return fetch_day(day)
+        except Exception as exc:
+            if not allow_partial:
+                raise
+            with incomplete_dates_lock:
+                incomplete_dates.add(day)
+            logger.warning(
+                "Yönlendirme geçmişi günü atlandı (%s): %s",
+                day.isoformat(),
+                exc,
+            )
+            return []
+
     if len(days) == 1:
-        return fetch_day(days[0])
+        rows = fetch_day_with_fallback(days[0])
+        return RoutingConversationRows(rows, incomplete_dates=incomplete_dates)
 
     with ThreadPoolExecutor(max_workers=min(_ROUTING_FETCH_WORKERS, len(days))) as pool:
-        return [
+        rows = [
             row
-            for day_rows in pool.map(fetch_day, days)
+            for day_rows in pool.map(fetch_day_with_fallback, days)
             for row in day_rows
         ]
+    return RoutingConversationRows(rows, incomplete_dates=incomplete_dates)
 
 
 def get_available_queues(
