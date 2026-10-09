@@ -2,7 +2,7 @@ import json
 import os
 import threading
 from copy import deepcopy
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 from json_storage import load_json, save_json
@@ -10,6 +10,7 @@ from json_storage import load_json, save_json
 DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
     "company_code": "",
     "backfilled_dates": [],
+    "live_delivery_since": None,
 }
 
 
@@ -118,6 +119,24 @@ class ConfigStore:
     def last_poll_date(self, value: date) -> None:
         with self._lock:
             self._runtime["last_poll_date"] = value.isoformat()
+            self._save_runtime()
+
+    @property
+    def live_delivery_since(self) -> datetime | None:
+        value = self._runtime.get("live_delivery_since")
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value))
+        except ValueError as exc:
+            raise ValueError("Geçersiz canlı bildirim başlangıç zamanı") from exc
+
+    @live_delivery_since.setter
+    def live_delivery_since(self, value: datetime) -> None:
+        if value.tzinfo is not None:
+            raise ValueError("Canlı bildirim başlangıç zamanı yerel ve saat dilimsiz olmalı")
+        with self._lock:
+            self._runtime["live_delivery_since"] = value.isoformat()
             self._save_runtime()
 
     @company_code.setter

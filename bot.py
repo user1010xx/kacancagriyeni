@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 # .env diğer yerel importlardan / ConfigStore'dan önce yüklenmeli
 from dotenv import load_dotenv
+from invekto_client import parse_call_datetime
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -149,6 +150,19 @@ delivered_store.retention_hours = DELIVERED_RETENTION_DAYS * 24
 def _report_today() -> date:
     """PBX rapor tarihi ile uyumlu 'bugün' (Railway UTC olsa bile TR takvimi)."""
     return dtm.now(REPORT_TZ).date()
+
+
+def _ensure_live_delivery_since() -> dtm:
+    since = config.live_delivery_since
+    if since is None:
+        since = dtm.now(REPORT_TZ).replace(tzinfo=None)
+        config.live_delivery_since = since
+        logger.info(
+            "Canlı kaçan çağrı iletimi başlangıcı kaydedildi: %s",
+            since.isoformat(timespec="seconds"),
+        )
+    return since
+
 
 HELP_TEXT = (
     "Merhaba! Bu bot PBX kaçan (cevapsız) çağrıları Telegram'a iletir.\n"
@@ -334,6 +348,36 @@ def _apply_time_cutoff(calls: list, target_date: date, cutoff: str, *, delivery_
         len(after),
     )
     return after
+
+
+def _apply_live_delivery_cutoff(
+    calls: list[dict],
+    since: dtm,
+    *,
+    delivery_state=None,
+) -> list[dict]:
+    """Eski veya zamanı çözümlenemeyen kayıtları bildirmeden kapatır."""
+    state = delivery_state if delivery_state is not None else sent_store
+    eligible: list[dict] = []
+    skipped = 0
+    for call in calls:
+        call_time = parse_call_datetime(call)
+        if call_time is not None and call_time >= since:
+            eligible.append(call)
+            continue
+        keys = call_key_variants(call)
+        if not state.is_complete_any(keys):
+            state.mark_complete_keys(keys, save=False)
+            skipped += 1
+    if skipped:
+        state.flush()
+    logger.info(
+        "Canlı başlangıç filtresi >=%s: %s çağrı uygun, %s eski/zamanı belirsiz çağrı atlandı",
+        since.isoformat(timespec="seconds"),
+        len(eligible),
+        skipped,
+    )
+    return eligible
 
 
 def _allowed_chat_filter() -> filters.MessageFilter:
@@ -1236,6 +1280,7 @@ async def _process_missed_calls_for_date(
     context: ContextTypes.DEFAULT_TYPE | None = None,
     throttle_seconds: float = 0.0,
     after_time: str | None = None,
+    since_datetime: dtm | None = None,
     should_cancel=None,
     delivery_state=None,
 ) -> tuple[int, int]:
@@ -1313,6 +1358,12 @@ async def _process_missed_calls_for_date(
 
         calls = dedupe_calls_by_key(calls + pending_calls)
         unique_call_count = len(calls)
+        if since_datetime is not None:
+            calls = _apply_live_delivery_cutoff(
+                calls,
+                since_datetime,
+                delivery_state=state,
+            )
         state.remember_calls(calls)
 
         cutoff = after_time or _cutoff_time_for_date(target_date)
@@ -1504,6 +1555,8 @@ async def poll_missed_calls(context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    since_datetime = _ensure_live_delivery_since()
+
     if config.is_toniva:
         logger.info(
             "Toniva kuyruk detay raporunun güncellenmesi için %s saniye bekleniyor",
@@ -1517,29 +1570,19 @@ async def poll_missed_calls(context: ContextTypes.DEFAULT_TYPE) -> None:
     _purge_delivered_store_by_retention_window()
 
     today = _report_today()
-    dates = {today, today - timedelta(days=1)} | sent_store.pending_dates()
-    if _env_flag("BACKFILL_ON_STARTUP", default=True):
-        after_time = os.getenv("BACKFILL_AFTER_TIME", "14:57:00").strip() or None
-        for raw in os.getenv("BACKFILL_DATES", "").split(","):
-            try:
-                target = dtm.strptime(raw.strip(), "%d.%m.%Y").date()
-            except ValueError:
-                continue
-            if target <= today and not config.is_backfilled(target, after_time):
-                dates.add(target)
-    last_day = config.last_poll_date
-    if last_day is not None:
-        day = max(last_day, today - timedelta(days=sent_store.max_age_days))
-        while day < today:
-            dates.add(day)
-            day += timedelta(days=1)
+    dates = {today}
     sent_now = failed_dm = 0
     success = True
     poll_error = "-"
     failure_summary = ""
     for target in sorted(dates, reverse=True):
         try:
-            sent_count, failed_count = await _process_missed_calls_for_date(context.bot, target, context=context)
+            sent_count, failed_count = await _process_missed_calls_for_date(
+                context.bot,
+                target,
+                context=context,
+                since_datetime=since_datetime,
+            )
             sent_now += sent_count
             failed_dm += failed_count
             cutoff = _cutoff_time_for_date(target)
@@ -1621,11 +1664,12 @@ async def _seed_today_missed_calls_if_needed() -> int:
         return 0
 
     today = _report_today()
+    since_datetime = _ensure_live_delivery_since()
     try:
         calls = await asyncio.to_thread(
             fetch_missed_calls,
             company_code,
-            today - timedelta(days=1),
+            today,
             today,
             uncompleted_only=False,
             **_fetch_kwargs(),
@@ -1637,6 +1681,9 @@ async def _seed_today_missed_calls_if_needed() -> int:
     calls = dedupe_calls_by_key(calls)
     seeded = 0
     for call in calls:
+        call_time = parse_call_datetime(call)
+        if call_time is not None and call_time >= since_datetime:
+            continue
         keys = call_key_variants(call)
         if not sent_store.is_complete_any(keys):
             sent_store.mark_complete_keys(keys, save=False)
@@ -1653,7 +1700,7 @@ async def _seed_today_missed_calls_if_needed() -> int:
 
 
 async def _backfill_missed_calls(application: Application) -> None:
-    """Deploy sonrası yalnızca BACKFILL_DATES ile belirtilen günleri işler."""
+    """Yalnızca bugünün açıkça belirtilen kısmını canlı başlangıçtan sonra işler."""
     if not _env_flag("BACKFILL_ON_STARTUP", default=True):
         return
 
@@ -1679,6 +1726,9 @@ async def _backfill_missed_calls(application: Application) -> None:
         except ValueError:
             logger.warning("BACKFILL_DATES geçersiz tarih atlandı: %s", part)
             continue
+        if target != _report_today():
+            logger.info("Geçmiş tarih backfill'i canlı modda atlandı: %s", target.isoformat())
+            continue
 
         job_key = config.backfill_job_key(target, after_time)
         if job_key in seen or config.is_backfilled(target, after_time):
@@ -1695,6 +1745,7 @@ async def _backfill_missed_calls(application: Application) -> None:
             target,
             throttle_seconds=throttle,
             after_time=after_time,
+            since_datetime=_ensure_live_delivery_since(),
         )
         if not sent_store.pending_calls(target):
             config.mark_backfilled(target, after_time)
@@ -1795,6 +1846,7 @@ async def post_init(application: Application) -> None:
     logger.info("Yetkili grup ID: %s", config.target_chat_id)
     logger.info("İzlenen kuyruk/departmanlar: %s", config.department_name or "Tümü")
     logger.info("DATA_DIR: %s", DATA_DIR)
+    _ensure_live_delivery_since()
 
     try:
         await _seed_today_missed_calls_if_needed()

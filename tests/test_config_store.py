@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 import pytest
@@ -37,3 +38,15 @@ def test_invalid_runtime_json_recovers_backup(tmp_path):
     path.write_text("{invalid", encoding="utf-8")
     assert ConfigStore(path).company_code == "12345678"
     assert list(tmp_path.glob("*.corrupt"))
+
+
+def test_live_delivery_start_time_persists_across_restarts(tmp_path):
+    path = tmp_path / "config.json"
+    with patch.dict(os.environ, {"TELEGRAM_GROUP_CHAT_ID": "-1001"}, clear=False):
+        config = ConfigStore(path)
+        started = datetime(2026, 10, 9, 17, 54, 35, 598000)
+        config.live_delivery_since = started
+
+        restored = ConfigStore(path)
+
+    assert restored.live_delivery_since == started

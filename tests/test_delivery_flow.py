@@ -86,6 +86,33 @@ def test_failed_dm_not_reported(delivery):
     assert app.sent_store.pending_calls(today)
 
 
+def test_live_poll_silences_calls_before_persistent_start_time(delivery, monkeypatch):
+    today, call, telegram = delivery
+    older = {**call, "ID": "100", "ChekInTime": "12:00:00"}
+    newer = {**call, "ID": "102", "ChekInTime": "12:31:00"}
+    start_time = datetime.combine(today, datetime.strptime("12:30:00", "%H:%M:%S").time())
+    app.config.live_delivery_since = start_time
+    app.sent_store.remember_calls([older])
+    monkeypatch.setattr(app, "fetch_missed_calls", lambda *args, **kwargs: [older, newer])
+    app.personnel_store.add_or_update("105", "Ali", "ali", telegram_chat_id="123")
+    app.phone_map_store.set(call["Phone"], "105")
+
+    asyncio.run(
+        app._process_missed_calls_for_date(
+            telegram,
+            today,
+            since_datetime=start_time,
+        )
+    )
+
+    assert app.sent_store.is_complete_any(app.call_key_variants(older))
+    assert not app.sent_store.pending_calls(today)
+    delivered = app.delivered_store.get_by_call_date(today)
+    assert len(delivered) == 1
+    assert delivered[0]["call_key"] == app.call_key(newer)
+    assert telegram.send_message.await_count == 2
+
+
 def test_wrong_recipient_incident_routes_to_mahmut(delivery, monkeypatch):
     today, call, telegram = delivery
     call.update(Phone="905309644795", ChekInTime="13:53:42")
@@ -226,11 +253,13 @@ def test_poll_retains_error_when_later_day_succeeds(delivery, monkeypatch):
     monkeypatch.setattr(app, "_process_missed_calls_for_date", process)
     context = SimpleNamespace(bot=telegram, bot_data={})
     asyncio.run(app.poll_missed_calls(context))
+    process.assert_awaited_once()
+    assert process.call_args.args[1] == today
+    assert process.call_args.kwargs["since_datetime"] == app.config.live_delivery_since
     assert context.bot_data["last_poll_error"] == str(failure)
     assert "RuntimeError: Toniva HTTP 429" in context.bot_data["last_poll_failure"]
     assert context.bot_data["last_poll_failure_time"]
     assert app.config.last_poll_date == today - timedelta(days=2)
-    assert process.await_count == 3
 
 
 def test_toniva_poll_waits_for_queue_detail_before_scanning(delivery, monkeypatch):
@@ -309,6 +338,9 @@ def test_backfill_failure_does_not_mark_complete(delivery, monkeypatch):
 
 def test_backfill_pending_does_not_mark_complete(delivery, monkeypatch):
     today, call, telegram = delivery
+    call["ChekInTime"] = (
+        datetime.now(app.REPORT_TZ).replace(tzinfo=None) + timedelta(minutes=1)
+    ).strftime("%H:%M:%S")
     monkeypatch.setenv("BACKFILL_DATES", today.strftime("%d.%m.%Y"))
     monkeypatch.setenv("BACKFILL_AFTER_TIME", "00:00:00")
     monkeypatch.setenv("BACKFILL_ON_STARTUP", "true")
@@ -316,6 +348,20 @@ def test_backfill_pending_does_not_mark_complete(delivery, monkeypatch):
     asyncio.run(app._backfill_missed_calls(SimpleNamespace(bot=telegram)))
     assert not app.config.is_backfilled(today, "00:00:00")
     assert app.sent_store.pending_calls(today)
+
+
+def test_startup_backfill_skips_historical_dates(delivery, monkeypatch):
+    today, _, telegram = delivery
+    historical = today - timedelta(days=1)
+    monkeypatch.setenv("BACKFILL_DATES", historical.strftime("%d.%m.%Y"))
+    monkeypatch.setenv("BACKFILL_ON_STARTUP", "true")
+    process = AsyncMock()
+    monkeypatch.setattr(app, "_process_missed_calls_for_date", process)
+
+    asyncio.run(app._backfill_missed_calls(SimpleNamespace(bot=telegram)))
+
+    process.assert_not_awaited()
+    assert not app.config.is_backfilled(historical, "14:57:00")
 
 
 def test_pbx_report_failure_is_unknown_not_uncalled(delivery, monkeypatch):
@@ -345,7 +391,7 @@ def test_seed_covers_poll_lookback(delivery, monkeypatch):
     monkeypatch.setattr(app, "fetch_missed_calls", fetch)
     monkeypatch.setenv("SEED_TODAY_ON_STARTUP", "true")
     asyncio.run(app._seed_today_missed_calls_if_needed())
-    assert fetch.call_args.args[1:3] == (today - timedelta(days=1), today)
+    assert fetch.call_args.args[1:3] == (today, today)
     assert app.config.last_poll_date == today
 
 
