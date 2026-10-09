@@ -153,6 +153,35 @@ def test_routing_history_retries_transient_failure(delivery, monkeypatch):
     assert app.sent_store.is_complete_any(app.call_key_variants(call))
 
 
+def test_saved_pending_call_is_processed_when_missed_call_api_is_unavailable(
+    delivery, monkeypatch
+):
+    today, call, telegram = delivery
+    app.sent_store.remember_calls([call])
+
+    def fetch_unavailable(*args, **kwargs):
+        raise app.PbxError("Toniva HTTP 503")
+
+    monkeypatch.setattr(app, "fetch_missed_calls", fetch_unavailable)
+
+    asyncio.run(app._process_missed_calls_for_date(telegram, today))
+
+    telegram.send_message.assert_awaited()
+    assert app.sent_store.pending_calls(today)
+
+
+def test_today_scan_summary_is_exposed_in_stats_data(delivery):
+    today, _, telegram = delivery
+    context = SimpleNamespace(bot=telegram, bot_data={})
+
+    asyncio.run(
+        app._process_missed_calls_for_date(telegram, today, context=context)
+    )
+
+    assert "API=1" in context.bot_data["last_today_scan"]
+    assert "uygun=1" in context.bot_data["last_today_scan"]
+
+
 def test_debug_routing_uses_requested_call_time_without_mutation(delivery, monkeypatch):
     today, call, telegram = delivery
     app.personnel_store.add_or_update("657", "Mahmut", "mahmut", telegram_chat_id="65700")

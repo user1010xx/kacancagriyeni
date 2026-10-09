@@ -308,6 +308,39 @@ def _request_json(
                 time.sleep(max(wait, 0.5))
                 continue
 
+            if response.status_code >= 500:
+                message = response.text[:300]
+                try:
+                    err_body = response.json()
+                    if isinstance(err_body, dict):
+                        message = (
+                            err_body.get("message")
+                            or err_body.get("Message")
+                            or err_body.get("code")
+                            or message
+                        )
+                except Exception:
+                    pass
+                if attempt == 2:
+                    raise TonivaError(
+                        f"Toniva HTTP {response.status_code}: {message} "
+                        "after 3 attempts"
+                    )
+                retry_after = response.headers.get("Retry-After", "")
+                try:
+                    wait = float(retry_after)
+                except (TypeError, ValueError):
+                    wait = 1.5 * (attempt + 1)
+                wait = min(max(wait, 0.5), 5.0)
+                logger.warning(
+                    "Toniva HTTP %s, %.1fs sonra yeniden denenecek: %s",
+                    response.status_code,
+                    wait,
+                    message,
+                )
+                time.sleep(wait)
+                continue
+
             if response.status_code >= 400:
                 message = response.text[:300]
                 try:

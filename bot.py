@@ -444,6 +444,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"🕒 Son poll (bu oturum): {bot_data.get('last_poll_count', '-')}\n"
         f"🕒 Son poll zamanı: {bot_data.get('last_poll_time', '-')}\n"
         f"⚡ Son API süresi: {bot_data.get('last_api_duration_ms', '-')} ms\n"
+        f"🔎 Bugünkü tarama: {bot_data.get('last_today_scan', '-')}\n"
         f"❌ Son poll hatası: {bot_data.get('last_poll_error', '-')}\n"
         f"{failure_line}"
         f"📭 Başarısız DM (bu oturum): {bot_data.get('failed_dm_count', 0)}\n"
@@ -1240,6 +1241,9 @@ async def _process_missed_calls_for_date(
         sent_now = 0
         failed_dm = 0
         api_started = time.monotonic()
+        pending_calls = state.pending_calls(target_date)
+        pending_call_count = len(pending_calls)
+        api_error: str | None = None
 
         try:
             calls = await asyncio.to_thread(
@@ -1259,20 +1263,39 @@ async def _process_missed_calls_for_date(
                     last_poll_error="-",
                 )
         except Exception as exc:
-            logger.warning(
-                "Kaçan çağrı kontrolü başarısız (%s): %s",
-                target_date.isoformat(),
-                exc,
-            )
-            if context is not None:
-                _update_bot_data(context, last_poll_error=str(exc))
-            raise PbxError("Kaçan çağrı sorgusu başarısız") from exc
+            api_error = str(exc)
+            api_call_count = 0
+            if pending_calls:
+                logger.warning(
+                    "Kaçan çağrı sorgusu başarısız (%s); kayıtlı %s bekleyen çağrı "
+                    "PBX sorgusu olmadan işlenecek: %s",
+                    target_date.isoformat(),
+                    pending_call_count,
+                    exc,
+                )
+                calls = []
+            else:
+                logger.warning(
+                    "Kaçan çağrı kontrolü başarısız (%s): %s",
+                    target_date.isoformat(),
+                    exc,
+                )
+                if context is not None:
+                    _update_bot_data(context, last_poll_error=str(exc))
+                    if target_date == _report_today():
+                        _update_bot_data(
+                            context,
+                            last_today_scan=f"API sorgusu başarısız: {exc}",
+                        )
+                raise PbxError("Kaçan çağrı sorgusu başarısız") from exc
+
+        if api_error is not None and context is not None:
+            api_ms = int((time.monotonic() - api_started) * 1000)
+            _update_bot_data(context, last_api_duration_ms=api_ms)
 
         if should_cancel and should_cancel():
             return 0, 0
 
-        pending_calls = state.pending_calls(target_date)
-        pending_call_count = len(pending_calls)
         calls = dedupe_calls_by_key(calls + pending_calls)
         unique_call_count = len(calls)
         state.remember_calls(calls)
@@ -1285,16 +1308,27 @@ async def _process_missed_calls_for_date(
         calls = [call for call in calls if not state.is_complete_any(call_key_variants(call))]
         if should_cancel and should_cancel():
             return 0, 0
+
         logger.info(
             "Kaçan çağrı işleme (%s): api=%s pending=%s unique=%s "
-            "after_cutoff=%s eligible=%s",
+            "after_cutoff=%s eligible=%s api_error=%s",
             target_date.isoformat(),
             api_call_count,
             pending_call_count,
             unique_call_count,
             after_cutoff_count,
             len(calls),
+            api_error or "-",
         )
+        if context is not None and target_date == _report_today():
+            _update_bot_data(
+                context,
+                last_today_scan=(
+                    f"API={api_call_count}, bekleyen={pending_call_count}, "
+                    f"tekil={unique_call_count}, uygun={len(calls)}, "
+                    f"API hatası={api_error or '-'}"
+                ),
+            )
         if not calls:
             return 0, 0
         for attempt in range(2):

@@ -42,6 +42,51 @@ def test_request_json_reports_exhausted_rate_limit(monkeypatch):
     assert request.call_count == 3
 
 
+def test_request_json_retries_toniva_503(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("TONIVA_API_KEY", "test-key")
+    unavailable = SimpleNamespace(
+        status_code=503,
+        headers={"Retry-After": "0"},
+        content=b"CRM-2491",
+        text="CRM-2491",
+    )
+    success = SimpleNamespace(
+        status_code=200,
+        headers={},
+        content=b'{"ok": true}',
+        json=lambda: {"ok": True},
+    )
+    with patch(
+        "toniva_client.requests.request",
+        side_effect=[unavailable, success],
+    ) as request:
+        with patch("toniva_client.time.sleep") as sleep:
+            assert _request_json("GET", "/reports/queue-detail") == {"ok": True}
+
+    assert request.call_count == 2
+    sleep.assert_called_once_with(0.5)
+
+
+def test_request_json_reports_exhausted_toniva_503(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("TONIVA_API_KEY", "test-key")
+    unavailable = SimpleNamespace(
+        status_code=503,
+        headers={},
+        content=b"CRM-2491",
+        text="CRM-2491",
+    )
+    with patch("toniva_client.requests.request", return_value=unavailable) as request:
+        with patch("toniva_client.time.sleep"):
+            with pytest.raises(TonivaError, match="HTTP 503.*after 3 attempts"):
+                _request_json("GET", "/reports/queue-detail")
+
+    assert request.call_count == 3
+
+
 def test_is_missed_status_cevapsiz():
     assert is_missed_status({"Status": "Cevapsız"})
     assert is_missed_status({"durum": "cevapsız"})
