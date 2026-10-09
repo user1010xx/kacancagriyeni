@@ -180,6 +180,7 @@ def test_debug_routing_uses_requested_call_time_without_mutation(delivery, monke
 def test_poll_retains_error_when_later_day_succeeds(delivery, monkeypatch):
     today, call, telegram = delivery
     app.config.last_poll_date = today - timedelta(days=2)
+    monkeypatch.setattr(app.asyncio, "sleep", AsyncMock())
     failure = app.PbxError("Yönlendirme için dış arama geçmişi alınamadı")
     failure.__cause__ = RuntimeError("Toniva HTTP 429")
     process = AsyncMock(side_effect=[failure, (0, 0), (0, 0)])
@@ -191,6 +192,33 @@ def test_poll_retains_error_when_later_day_succeeds(delivery, monkeypatch):
     assert context.bot_data["last_poll_failure_time"]
     assert app.config.last_poll_date == today - timedelta(days=2)
     assert process.await_count == 3
+
+
+def test_toniva_poll_waits_for_queue_detail_before_scanning(delivery, monkeypatch):
+    today, _, telegram = delivery
+    events = []
+    monkeypatch.setattr(
+        app.ConfigStore,
+        "is_toniva",
+        property(lambda self: True),
+    )
+
+    async def sleep(seconds):
+        events.append(("sleep", seconds))
+
+    async def process(*args, **kwargs):
+        events.append(("scan", args[1]))
+        return 0, 0
+
+    monkeypatch.setattr(app.asyncio, "sleep", sleep)
+    monkeypatch.setattr(app, "_process_missed_calls_for_date", process)
+    context = SimpleNamespace(bot=telegram, bot_data={})
+
+    asyncio.run(app.poll_missed_calls(context))
+
+    assert events[0] == ("sleep", app.TONIVA_QUEUE_DETAIL_SETTLE_SECONDS)
+    assert all(event[0] == "scan" for event in events[1:])
+    assert events[1][1] == today
 
 
 def test_replay_preserves_existing_delivery_history(delivery, monkeypatch):

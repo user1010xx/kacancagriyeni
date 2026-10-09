@@ -103,6 +103,7 @@ phone_map_store = PhoneMapStore(DATA_DIR / "phone_map.json")
 gonder_control = GonderControl(DATA_DIR / "gonder_state.json")
 _MISSED_CALL_PROCESS_LOCK = asyncio.Lock()
 _GONDER_COMMAND_LOCK = asyncio.Lock()
+TONIVA_QUEUE_DETAIL_SETTLE_SECONDS = 10
 
 # /gonder durdur | stop | iptal | cancel | sessiz
 _GONDER_STOP_TOKENS = frozenset(
@@ -1383,6 +1384,16 @@ async def poll_missed_calls(context: ContextTypes.DEFAULT_TYPE) -> None:
             gonder_control.should_stop(),
         )
         return
+
+    if config.is_toniva:
+        logger.info(
+            "Toniva kuyruk detay raporunun güncellenmesi için %s saniye bekleniyor",
+            TONIVA_QUEUE_DETAIL_SETTLE_SECONDS,
+        )
+        await asyncio.sleep(TONIVA_QUEUE_DETAIL_SETTLE_SECONDS)
+        if gonder_control.is_running() or gonder_control.should_stop():
+            logger.info("Poll atlandı: bekleme sırasında /gonder başlatıldı")
+            return
 
     _purge_delivered_store_by_retention_window()
 
